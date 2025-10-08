@@ -42,6 +42,7 @@ fn load_and_clear_prediction(
             Entity,
             &mut PredictedHistory,
             Option<(&AuthoritativeHistory, &ConfirmHistory)>,
+            Has<Disabled>,
         ),
         (With<Predicted>, Or<(With<Disabled>, Without<Disabled>)>),
     >,
@@ -55,7 +56,7 @@ fn load_and_clear_prediction(
     let mut removes = RemoveBatch::new();
 
     // TODO: Can we par_iter this?
-    for (entity, mut predicted, maybe_authoritative) in q.iter_mut() {
+    for (entity, mut predicted, maybe_authoritative, is_disabled) in q.iter_mut() {
         let mut load_commands = Commands::new_from_entities(&mut load_queue, entities);
         for (&comp_id, pred_hist) in predicted.iter_mut() {
             let &reg_idx = registry.ids.get(&comp_id).unwrap();
@@ -80,14 +81,18 @@ fn load_and_clear_prediction(
 
             match (auth, pred) {
                 (TickData::Removed, _) | (TickData::Missing, TickData::Removed) => {
-                    removes.push(comp_id);
+                    if !is_disabled {
+                        removes.push(comp_id);
+                    }
                 }
                 (TickData::Missing, TickData::Missing) => {
-                    // We are loading a value from before the history
-                    // remove the component until the history starts
-                    removes.push(comp_id);
-                    pred_hist.keep_first_item();
-                    continue;
+                    if !is_disabled {
+                        // We are loading a value from before the history
+                        // remove the component until the history starts
+                        removes.push(comp_id);
+                        pred_hist.keep_first_item();
+                        continue;
+                    }
                 }
                 (auth, pred) => {
                     inserts.push(comp_id, component, |dst| unsafe {
