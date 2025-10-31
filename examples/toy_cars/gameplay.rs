@@ -16,7 +16,7 @@ pub fn gameplay_plugin(app: &mut App) {
         // Set up replication
         .replicate::<Car>()
         .replicate::<Ball>()
-        .add_client_event::<LocalEntities>(Channel::Unordered)
+        .add_client_message::<LocalEntities>(Channel::Unordered)
         .add_systems(
             OnEnter(ConnectionState::InGame),
             (
@@ -37,7 +37,10 @@ pub fn gameplay_plugin(app: &mut App) {
             (move_cars, spawn_ball.run_if(in_state(ServerState::Running)))
                 .run_if(in_state(ConnectionState::InGame)),
         )
-        .add_systems(SimulationPostUpdate, process_goals.after(PhysicsSet::Sync))
+        .add_systems(
+            SimulationPostUpdate,
+            process_goals.after(PhysicsSystems::Last),
+        )
         .add_systems(
             Update,
             (add_car_models, add_ball_model, follow_car).run_if(in_state(ConnectionState::InGame)),
@@ -56,7 +59,7 @@ pub fn gameplay_plugin(app: &mut App) {
 struct Car;
 
 #[derive(Component)]
-#[require(Car)]
+#[require(Car, InputAuthority)]
 pub struct OurCar;
 
 #[derive(Component, Serialize, Deserialize)]
@@ -175,23 +178,21 @@ fn spawn_ball(
     commands.spawn((Ball, Transform::from_xyz(0., 5., -1.5), Replicated));
 }
 
-#[derive(Event, Serialize, Deserialize)]
+#[derive(Message, Serialize, Deserialize)]
 struct LocalEntities {
     time: u128,
 }
 
 fn claim_car(mut commands: Commands, car: Single<Entity, With<OurCar>>) {
     let time = std::time::UNIX_EPOCH.elapsed().unwrap().as_millis();
-    commands.send_event(LocalEntities { time });
-    commands
-        .entity(*car)
-        .insert((InputAuthority, Signature::from(time)));
+    commands.write_message(LocalEntities { time });
+    commands.entity(*car).insert(Signature::from(time));
 }
 
-fn spawn_client_cars(mut commands: Commands, mut spawns: EventReader<FromClient<LocalEntities>>) {
+fn spawn_client_cars(mut commands: Commands, mut spawns: MessageReader<FromClient<LocalEntities>>) {
     for &FromClient {
         client_id,
-        event: LocalEntities { time: sig },
+        message: LocalEntities { time: sig },
     } in spawns.read()
     {
         let Some(client_entity) = client_id.entity() else {
@@ -214,7 +215,9 @@ fn spawn_client_cars(mut commands: Commands, mut spawns: EventReader<FromClient<
 }
 
 fn add_replicated(mut commands: Commands, car: Single<Entity, With<OurCar>>) {
-    commands.entity(*car).insert(Replicated);
+    commands
+        .entity(*car)
+        .insert((InputQueue::<GameInput>::default(), Replicated));
 }
 
 fn add_car_models(

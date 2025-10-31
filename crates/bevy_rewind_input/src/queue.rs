@@ -30,7 +30,7 @@ impl<T: InputTrait> InputQueue<T> {
     }
 
     pub(crate) fn add(&mut self, tick: impl Into<RepliconTick>, history: &InputHistory<T>) {
-        let newest_missing = RepliconTick::new(
+        let next_accepted = RepliconTick::new(
             tick.into().get().max(
                 self.queue
                     .back()
@@ -38,12 +38,12 @@ impl<T: InputTrait> InputQueue<T> {
                     .unwrap_or_default(),
             ),
         );
-        if history.updated_at() < newest_missing {
+        if history.updated_at() < next_accepted {
             return;
         }
 
         let first_tick = history.first_tick();
-        let offset = newest_missing.get().saturating_sub(first_tick.get()) as usize;
+        let offset = next_accepted.get().saturating_sub(first_tick.get()) as usize;
         let remaining_capacity = self.queue.capacity() - self.queue.len();
 
         self.queue.extend_back(
@@ -58,12 +58,12 @@ impl<T: InputTrait> InputQueue<T> {
 
     pub(crate) fn next(&mut self, tick: impl Into<RepliconTick>) -> Option<T> {
         let tick = tick.into();
-        let mut newest_miss = None;
+        let mut newest_late = None;
         while !self.queue.is_empty() && self.queue[0].0 < tick {
-            newest_miss = self.queue.pop_front();
+            newest_late = self.queue.pop_front();
         }
         if self.queue.is_empty() || self.queue[0].0 != tick {
-            if let Some((from_tick, t)) = newest_miss {
+            if let Some((from_tick, t)) = newest_late {
                 if let Some(input) = t.repeated(tick - from_tick) {
                     self.past.push_back((tick, input.clone()));
                     return Some(input);
@@ -113,12 +113,12 @@ mod tests {
         queue.add(Tick(10), &hist(7, [A(79), A(80)]));
         assert_eq!(queue.queue.len(), 0);
 
-        // When adding items to an empty queue, only the new items get added
+        // When adding items to an empty queue, only the current or future items get added
         queue.add(Tick(10), &hist(9, [A(0), A(1), A(2)]));
         assert_eq!(queue.queue.len(), 2);
 
-        // When adding items to a queue that has items, only newer items get added
-        queue.add(Tick(10), &hist(10, [A(1), A(2), A(3)]));
+        // When adding items to a queue that has items, only missing ticks get added
+        queue.add(Tick(10), &hist(10, [A(29), A(42), A(3)]));
         assert_eq!(queue.queue.len(), 3);
 
         // If for whatever reason there is a gap nothing should break

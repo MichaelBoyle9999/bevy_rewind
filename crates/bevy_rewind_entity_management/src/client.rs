@@ -7,7 +7,7 @@ use crate::{
 use std::marker::PhantomData;
 
 use bevy::{
-    ecs::{component::HookContext, entity_disabling::Disabled, world::DeferredWorld},
+    ecs::{entity_disabling::Disabled, lifecycle::HookContext, world::DeferredWorld},
     prelude::*,
 };
 use bevy_replicon::{
@@ -290,7 +290,7 @@ impl EntityManagementCommands for Commands<'_, '_> {
         let Ok(mut ec) = self.get_entity(entity) else {
             return;
         };
-        ec.queue(|entity: EntityWorldMut| entity.disable_or_despawn());
+        ec.queue_silenced(|entity: EntityWorldMut| entity.disable_or_despawn());
     }
 }
 

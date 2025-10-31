@@ -103,7 +103,7 @@ fn update_archetype_cache(
 
         let mut predicted = Vec::new();
 
-        for component_id in archetype.components() {
+        for &component_id in archetype.components() {
             if let Some(&index) = registry.ids.get(&component_id) {
                 predicted.push((component_id, index));
             }

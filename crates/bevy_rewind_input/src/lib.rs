@@ -51,8 +51,8 @@ impl<T: InputTrait, Tick: TickSource> InputQueuePlugin<T, Tick> {
 
 impl<T: InputTrait, Tick: TickSource> Plugin for InputQueuePlugin<T, Tick> {
     fn build(&self, app: &mut App) {
-        app.add_mapped_client_event::<InputHistory<T>>(Channel::Unreliable)
-            .add_mapped_server_event::<HistoryFor<T>>(Channel::Unreliable);
+        app.add_mapped_client_message::<InputHistory<T>>(Channel::Unreliable)
+            .add_mapped_server_message::<HistoryFor<T>>(Channel::Unreliable);
 
         #[cfg(feature = "client")]
         app.add_plugins(client::InputQueueClientPlugin::<T, Tick>::new(
@@ -104,7 +104,7 @@ pub trait InputTrait:
     }
 }
 
-#[derive(Event, Clone, TypePath, Serialize, Deserialize, PartialEq, Eq, Debug)]
+#[derive(Message, Clone, TypePath, Serialize, Deserialize, PartialEq, Eq, Debug)]
 #[serde(bound(deserialize = "T: for<'de2> serde::Deserialize<'de2>"))]
 struct HistoryFor<T: InputTrait> {
     entity: Entity,

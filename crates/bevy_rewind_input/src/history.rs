@@ -7,7 +7,7 @@ use bevy_replicon::shared::replicon_tick::RepliconTick;
 use serde::{Deserialize, Serialize};
 
 /// The input history for an input. Used when sending data to the server, also useful for rollback
-#[derive(Event, Component, Clone, TypePath, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Message, Component, Clone, TypePath, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(bound(deserialize = "T: for<'de2> serde::Deserialize<'de2>"))]
 pub struct InputHistory<T: InputTrait> {
     // TODO: ArrayDeque?
@@ -58,13 +58,19 @@ impl<T: InputTrait> InputHistory<T> {
     }
 
     /// Get the input for the specified tick, if it exists
-    pub fn get(&self, tick: impl Into<RepliconTick>) -> Option<&T> {
+    pub fn get(&self, tick: impl Into<RepliconTick>, repeat: bool) -> Option<T> {
         let tick = tick.into();
-        if tick > self.updated_at || tick < self.first_tick() {
+        if (tick > self.updated_at() && !(repeat && T::repeats())) || tick < self.first_tick() {
             return None;
         }
+        if tick > self.updated_at() {
+            return self
+                .list
+                .back()
+                .and_then(|t| t.repeated(tick - self.updated_at()));
+        }
         let index = tick - self.first_tick();
-        self.list.get(index as usize)
+        self.list.get(index as usize).cloned()
     }
 
     /// Write an input to the history
@@ -145,16 +151,29 @@ pub(super) mod tests {
         let history = hist(10, [A(1), A(2), A(3), A(4), A(5)]);
 
         for i in 0..5 {
-            assert_eq!(Some(&A(1 + i)), history.get(Tick(10 + i as u32)));
+            assert_eq!(Some(A(1 + i)), history.get(Tick(10 + i as u32), false));
         }
 
         // All values outside of the history should return None
-        assert_eq!(None, history.get(Tick(9)));
-        assert_eq!(None, history.get(Tick(0)));
-        assert_eq!(None, history.get(Tick(5)));
-        assert_eq!(None, history.get(Tick(15)));
-        assert_eq!(None, history.get(Tick(20)));
-        assert_eq!(None, history.get(Tick(598182)));
+        assert_eq!(None, history.get(Tick(9), false));
+        assert_eq!(None, history.get(Tick(0), false));
+        assert_eq!(None, history.get(Tick(5), false));
+        assert_eq!(None, history.get(Tick(15), false));
+        assert_eq!(None, history.get(Tick(20), false));
+        assert_eq!(None, history.get(Tick(598182), false));
+    }
+
+    #[test]
+    fn get_repeats() {
+        let history = hist(0, [A(1)]);
+
+        for i in 0..5 {
+            assert_eq!(Some(A(1)), history.get(Tick(i as u32), true));
+        }
+
+        // Values beyond the repeat time should be empty
+        assert_eq!(None, history.get(Tick(6), true));
+        assert_eq!(None, history.get(Tick(2309), true));
     }
 
     #[test]

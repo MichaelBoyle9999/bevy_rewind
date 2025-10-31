@@ -43,7 +43,7 @@ impl<T: InputTrait, Tick: TickSource> Plugin for InputQueueClientPlugin<T, Tick>
         )
         .add_systems(
             PostUpdate,
-            send_input_events::<T>
+            send_input_messages::<T>
                 .run_if(in_state(ClientState::Connected))
                 .before(ClientSystems::Send)
                 .in_set(InputQueueSet::Network),
@@ -52,7 +52,7 @@ impl<T: InputTrait, Tick: TickSource> Plugin for InputQueueClientPlugin<T, Tick>
 }
 
 /// A marker component for entities for which this client has authority to send inputs
-#[derive(Component)]
+#[derive(Component, Default)]
 pub struct InputAuthority;
 
 fn store_inputs<T: InputTrait, Tick: TickSource>(
@@ -80,7 +80,7 @@ fn load_inputs<T: InputTrait, Tick: TickSource>(
     tick: Res<Tick>,
 ) {
     for (hist, mut input, authority) in query.iter_mut() {
-        let i = hist.get(*tick).cloned();
+        let i = hist.get(*tick, !authority);
         if i.is_none() && authority {
             continue;
         }
@@ -88,20 +88,20 @@ fn load_inputs<T: InputTrait, Tick: TickSource>(
     }
 }
 
-fn send_input_events<T: InputTrait>(
+fn send_input_messages<T: InputTrait>(
     hist: Query<&InputHistory<T>, With<InputAuthority>>,
-    mut events: EventWriter<InputHistory<T>>,
+    mut messages: MessageWriter<InputHistory<T>>,
 ) {
     for hist in hist.iter() {
         if hist.is_empty() {
             continue;
         }
-        events.write(hist.clone());
+        messages.write(hist.clone());
     }
 }
 
 fn receive_inputs<T: InputTrait>(
-    mut events: EventReader<HistoryFor<T>>,
+    mut messages: MessageReader<HistoryFor<T>>,
     mut query: Query<&mut InputHistory<T>>,
 ) {
     for HistoryFor {
@@ -109,7 +109,7 @@ fn receive_inputs<T: InputTrait>(
         tick,
         past,
         future,
-    } in events.read()
+    } in messages.read()
     {
         let Ok(mut history) = query.get_mut(*entity) else {
             warn_once!(
@@ -166,8 +166,8 @@ mod tests {
     #[test]
     fn sends_inputs_with_authority() {
         let mut app = App::new();
-        app.add_event::<InputHistory<A>>()
-            .add_systems(Update, send_input_events::<A>)
+        app.add_message::<InputHistory<A>>()
+            .add_systems(Update, send_input_messages::<A>)
             .insert_resource(Tick(5));
         app.world_mut().spawn((hist(5, [A(2)]), InputAuthority));
         app.world_mut().spawn(hist(5, [A(1)]));
@@ -175,14 +175,14 @@ mod tests {
 
         app.update();
 
-        let mut events = app
+        let mut messages = app
             .world()
-            .resource::<Events<InputHistory<A>>>()
-            .iter_current_update_events();
+            .resource::<Messages<InputHistory<A>>>()
+            .iter_current_update_messages();
         // An update was sent for the entity with authority
-        assert_eq!(Some(&hist(5, [A(2)])), events.next());
+        assert_eq!(Some(&hist(5, [A(2)])), messages.next());
         // But not for other entities
-        assert_eq!(None, events.next());
+        assert_eq!(None, messages.next());
     }
 
     #[test]
@@ -192,7 +192,7 @@ mod tests {
             .insert_resource(Tick(5));
         let e1 = app
             .world_mut()
-            .spawn((A(15), hist(3, [A(1), A(2), A(3)]), InputAuthority))
+            .spawn((A(15), hist(2, [A(1), A(2), A(3)]), InputAuthority))
             .id();
         let e2 = app
             .world_mut()
@@ -205,7 +205,7 @@ mod tests {
 
         app.update();
 
-        // Entities with InputAuthority should be reset
+        // Entities with InputAuthority should be untouched if the history is empty
         let e = app.world().entity(e1);
         assert_eq!(A(0), *e.get::<A>().unwrap());
 
@@ -219,12 +219,12 @@ mod tests {
     #[test]
     fn receive_input_writes_history() {
         let mut app = App::new();
-        app.add_event::<HistoryFor<A>>()
+        app.add_message::<HistoryFor<A>>()
             .add_systems(Update, receive_inputs::<A>);
         let e1 = app.world_mut().spawn(InputHistory::<A>::default()).id();
         let e2 = app.world_mut().spawn(InputHistory::<A>::default()).id();
 
-        app.world_mut().send_event(HistoryFor {
+        app.world_mut().write_message(HistoryFor {
             entity: e1,
             tick: Tick(5).into(),
             past: [(4u8, A(1)), (1, A(2))].into_iter().collect(),

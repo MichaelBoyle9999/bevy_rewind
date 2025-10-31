@@ -9,13 +9,12 @@ use crate::tick::GameTick;
 
 pub fn connect_plugin(app: &mut App) {
     app
-        // Connection events
-        .add_client_event::<Connect>(Channel::Unordered)
-        .add_server_event::<CurrentTick>(Channel::Unreliable)
-        .make_event_independent::<CurrentTick>()
+        // Connection messages
+        .add_client_message::<Connect>(Channel::Unordered)
+        .add_server_message::<CurrentTick>(Channel::Unreliable)
+        .make_message_independent::<CurrentTick>()
         // Set up state changes
         .init_state::<ConnectionState>()
-        .enable_state_scoped_entities::<ConnectionState>()
         .add_systems(OnEnter(ConnectionState::Menu), setup_connect_ui)
         .add_systems(OnEnter(ClientState::Connected), send_connect)
         .add_systems(
@@ -41,10 +40,10 @@ pub enum ConnectionState {
     InGame,
 }
 
-#[derive(Event, Serialize, Deserialize)]
+#[derive(Message, Serialize, Deserialize)]
 struct Connect;
 
-#[derive(Event, Serialize, Deserialize)]
+#[derive(Message, Serialize, Deserialize)]
 struct CurrentTick(GameTick);
 
 #[derive(Component)]
@@ -67,7 +66,7 @@ fn setup_connect_ui(mut commands: Commands) {
             ..default()
         },
         BackgroundColor(Color::BLACK),
-        StateScoped(ConnectionState::Menu),
+        DespawnOnExit(ConnectionState::Menu),
         children![
             (PortInput, Text("12345".into()), BackgroundColor(dark_gray)),
             (
@@ -89,18 +88,18 @@ fn setup_connect_ui(mut commands: Commands) {
         ],
     ));
 
-    commands.spawn((Camera2d::default(), StateScoped(ConnectionState::Menu)));
+    commands.spawn((Camera2d::default(), DespawnOnExit(ConnectionState::Menu)));
 }
 
 fn send_current_tick(
     mut commands: Commands,
-    mut spawns: EventReader<FromClient<Connect>>,
+    mut spawns: MessageReader<FromClient<Connect>>,
     tick: Res<GameTick>,
 ) {
     for &FromClient { client_id, .. } in spawns.read() {
-        commands.send_event(ToClients {
+        commands.write_message(ToClients {
             mode: SendMode::Direct(client_id),
-            event: CurrentTick(*tick),
+            message: CurrentTick(*tick),
         });
     }
 }
@@ -164,11 +163,11 @@ fn host_or_join(
 }
 
 fn send_connect(mut commands: Commands) {
-    commands.send_event(Connect);
+    commands.write_message(Connect);
 }
 
-fn receive_tick(mut commands: Commands, mut events: EventReader<CurrentTick>) {
-    let Some(&CurrentTick(mut tick)) = events.read().last() else {
+fn receive_tick(mut commands: Commands, mut messages: MessageReader<CurrentTick>) {
+    let Some(&CurrentTick(mut tick)) = messages.read().last() else {
         eprintln!("No tick :(");
         return;
     };

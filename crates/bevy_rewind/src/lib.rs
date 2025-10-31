@@ -15,9 +15,7 @@ use std::{fmt::Debug, marker::PhantomData};
 use bevy::{
     app::RunFixedMainLoop,
     ecs::{
-        component::{HookContext, Mutable},
-        intern::Interned,
-        schedule::ScheduleLabel,
+        component::Mutable, intern::Interned, lifecycle::HookContext, schedule::ScheduleLabel,
         world::DeferredWorld,
     },
     prelude::*,
@@ -117,8 +115,8 @@ impl<Tick: TickSource> Plugin for RollbackPlugin<Tick> {
                 trigger_rollback::<Tick>.run_if(rollback_requested),
             )
                 .chain()
-                .after(RunFixedMainLoopSystem::BeforeFixedMainLoop)
-                .before(RunFixedMainLoopSystem::FixedMainLoop),
+                .after(RunFixedMainLoopSystems::BeforeFixedMainLoop)
+                .before(RunFixedMainLoopSystems::FixedMainLoop),
         );
     }
 }
@@ -145,8 +143,8 @@ fn set_store_tick<Tick: TickSource>(mut commands: Commands, tick: Option<Res<Tic
 pub struct RequestedRollback(i16);
 
 fn calculate_rollback_target<Tick: TickSource>(
-    mut individual_confirms: EventReader<EntityReplicated>,
-    mut global_confirms: EventReader<MutateTickReceived>,
+    mut individual_confirms: MessageReader<EntityReplicated>,
+    mut global_confirms: MessageReader<MutateTickReceived>,
     tick: Res<Tick>,
     frames: ResMut<RollbackFrames>,
     mut rollback_target: ResMut<RollbackTarget>,
@@ -154,14 +152,20 @@ fn calculate_rollback_target<Tick: TickSource>(
 ) {
     let tick = (*tick).into();
 
-    for event_tick in individual_confirms
+    for message_tick in individual_confirms
         .read()
         .map(|c| c.tick)
         .chain(global_confirms.read().map(|c| c.tick))
     {
         **rollback_target = rollback_target
-            .map(|tick| if tick > event_tick { event_tick } else { tick })
-            .or(Some(event_tick))
+            .map(|tick| {
+                if tick > message_tick {
+                    message_tick
+                } else {
+                    tick
+                }
+            })
+            .or(Some(message_tick))
     }
 
     let min = tick.get().saturating_sub(frames.max_frames() as u32 - 2);
@@ -239,6 +243,7 @@ mod tests {
     use bevy::{
         ecs::schedule::InternedScheduleLabel,
         prelude::*,
+        state::app::StatesPlugin,
         time::{TimePlugin, TimeUpdateStrategy},
     };
     use bevy_replicon::client::server_mutate_ticks::{MutateTickReceived, ServerMutateTicks};
@@ -272,6 +277,7 @@ mod tests {
     fn init_app() -> App {
         let mut app = App::new();
         app.add_plugins((
+            StatesPlugin,
             RepliconSharedPlugin::default(),
             RollbackPlugin::<Tick> {
                 store_schedule: NoTy.intern(),
@@ -281,8 +287,8 @@ mod tests {
             TimePlugin,
         ))
         .init_resource::<ServerMutateTicks>()
-        .add_event::<EntityReplicated>()
-        .add_event::<MutateTickReceived>()
+        .add_message::<EntityReplicated>()
+        .add_message::<MutateTickReceived>()
         .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
             16,
         )))

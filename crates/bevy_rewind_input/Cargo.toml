@@ -12,7 +12,7 @@ server = ["bevy_replicon/server"]
 workspace = true
 
 [dependencies]
-bevy.workspace = true
+bevy = {workspace = true, features = ["serialize"]}
 
 bevy_replicon.workspace = true
 

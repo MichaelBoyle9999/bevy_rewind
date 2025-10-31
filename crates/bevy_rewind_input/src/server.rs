@@ -2,7 +2,9 @@
 
 use std::marker::PhantomData;
 
-use crate::{HistoryFor, InputHistory, InputQueue, InputQueueSet, InputTrait, TickSource};
+use crate::{
+    HistoryFor, InputAuthority, InputHistory, InputQueue, InputQueueSet, InputTrait, TickSource,
+};
 
 use bevy::{ecs::schedule::InternedScheduleLabel, prelude::*};
 use bevy_replicon::prelude::*;
@@ -32,19 +34,19 @@ impl<T: InputTrait, Tick: TickSource> Plugin for InputQueueServerPlugin<T, Tick>
                 .in_set(InputQueueSet::Network),
         )
         .add_systems(
-            PostUpdate,
-            send_inputs::<T, Tick>
-                .run_if(in_state(ServerState::Running))
-                .before(ServerSystems::Send)
-                .in_set(InputQueueSet::Network),
-        )
-        .add_systems(
             self.schedule,
             load_inputs::<T, Tick>
                 .run_if(in_state(ServerState::Running))
                 .in_set(InputQueueSet::Load)
                 // In case the configured schedule is PreUpdate
                 .after(InputQueueSet::Network),
+        )
+        .add_systems(
+            PostUpdate,
+            send_inputs::<T, Tick>
+                .run_if(in_state(ServerState::Running))
+                .before(ServerSystems::Send)
+                .in_set(InputQueueSet::Network),
         );
     }
 }
@@ -72,11 +74,11 @@ impl<T> InputTarget<T> {
 
 fn receive_inputs<T: InputTrait, Tick: TickSource>(
     input_target: Query<AnyOf<(&InputTarget<T>, &InputTarget)>>,
-    mut events: EventReader<FromClient<InputHistory<T>>>,
+    mut messages: MessageReader<FromClient<InputHistory<T>>>,
     mut query: Query<&mut InputQueue<T>>,
     cur_tick: Res<Tick>,
 ) {
-    for FromClient { client_id, event } in events.read() {
+    for FromClient { client_id, message } in messages.read() {
         let Some(client_entity) = client_id.entity() else {
             continue;
         };
@@ -87,27 +89,27 @@ fn receive_inputs<T: InputTrait, Tick: TickSource>(
         let Ok(mut input_queue) = query.get_mut(entity) else {
             continue;
         };
-        input_queue.add(*cur_tick, event);
+        input_queue.add(*cur_tick, message);
     }
 }
 
 fn send_inputs<T: InputTrait, Tick: TickSource>(
-    mut events: EventWriter<ToClients<HistoryFor<T>>>,
+    mut messages: MessageWriter<ToClients<HistoryFor<T>>>,
     query: Query<(Entity, &InputQueue<T>)>,
     cur_tick: Res<Tick>,
 ) {
     let cur_tick = (*cur_tick).into();
     for (entity, queue) in query.iter() {
-        if queue.past().any(|(t, _)| *t >= cur_tick) || queue.queue().any(|(t, _)| *t < cur_tick) {
+        if queue.past().any(|(t, _)| *t > cur_tick) || queue.queue().any(|(t, _)| *t < cur_tick) {
             warn_once!(
                 "({:?}) Queue has inputs with impossible ticks: {:?}",
                 cur_tick.get(),
                 queue
             );
         }
-        events.write(ToClients {
+        messages.write(ToClients {
             mode: SendMode::Broadcast,
-            event: HistoryFor {
+            message: HistoryFor {
                 entity,
                 tick: cur_tick,
                 past: queue
@@ -126,24 +128,21 @@ fn send_inputs<T: InputTrait, Tick: TickSource>(
 }
 
 fn load_inputs<T: InputTrait, Tick: TickSource>(
-    mut query: Query<(&mut T, &mut InputQueue<T>)>,
+    mut query: Query<(&mut T, &mut InputQueue<T>, Has<InputAuthority>)>,
     tick: Res<Tick>,
 ) {
-    for (mut input, mut input_queue) in query.iter_mut() {
-        match input_queue.next(*tick) {
-            Some(new_input) => {
-                *input = new_input;
-            }
-            None => {
-                *input = default();
-            }
+    for (mut input, mut input_queue, authority) in query.iter_mut() {
+        let found = input_queue.next(*tick);
+        if found.is_none() && authority {
+            continue;
         }
+        *input = found.unwrap_or_default();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use bevy::ecs::schedule::ScheduleLabel;
+    use bevy::{ecs::schedule::ScheduleLabel, state::app::StatesPlugin};
 
     use super::*;
     use crate::tests::*;
@@ -160,22 +159,22 @@ mod tests {
             .spawn((InputQueue::<A>::default(), InputTarget::all(e3)))
             .id();
 
-        app.add_event::<FromClient<InputHistory<A>>>()
+        app.add_message::<FromClient<InputHistory<A>>>()
             .add_systems(Update, receive_inputs::<A, Tick>)
             .insert_resource(Tick(5));
 
-        app.world_mut().send_event_batch([
+        app.world_mut().write_message_batch([
             FromClient {
                 client_id: ClientId::Client(e1),
-                event: hist(4, [A(1), A(2), A(3)]),
+                message: hist(4, [A(1), A(2), A(3)]),
             },
             FromClient {
                 client_id: ClientId::Client(e2),
-                event: hist(5, [A(1), A(2), A(3)]),
+                message: hist(5, [A(1), A(2), A(3)]),
             },
             FromClient {
                 client_id: ClientId::Client(e4),
-                event: hist(6, [A(1), A(2), A(3)]),
+                message: hist(6, [A(1), A(2), A(3)]),
             },
         ]);
 
@@ -200,25 +199,35 @@ mod tests {
         );
         assert_eq!(
             vec![
-                &(Tick(6).into(), A(1)),
-                &(Tick(7).into(), A(2)),
-                &(Tick(8).into(), A(3))
+                &(Tick(5).into(), A(1)),
+                &(Tick(6).into(), A(2)),
+                &(Tick(7).into(), A(3))
             ],
             e2.get::<InputQueue<A>>()
                 .unwrap()
                 .queue()
                 .collect::<Vec<_>>()
         );
-        // e3 had no events
-        assert_eq!(0, e3.get::<InputQueue<A>>().unwrap().queue().count());
-        // e4 isn't in ClientEvents and thus can't receive anything
+        // e3 got a message targeted for e4 because of InputTarget
+        assert_eq!(
+            vec![
+                &(Tick(6).into(), A(1)),
+                &(Tick(7).into(), A(2)),
+                &(Tick(8).into(), A(3))
+            ],
+            e3.get::<InputQueue<A>>()
+                .unwrap()
+                .queue()
+                .collect::<Vec<_>>()
+        );
+        // e4 isn't the target itself and thus received nothing
         assert_eq!(0, e4.get::<InputQueue<A>>().unwrap().queue().count());
     }
 
     #[test]
     fn sends_inputs() {
         let mut app = App::new();
-        app.add_event::<ToClients<HistoryFor<A>>>()
+        app.add_message::<ToClients<HistoryFor<A>>>()
             .add_systems(Update, send_inputs::<A, Tick>)
             .insert_resource(Tick(5));
 
@@ -231,10 +240,10 @@ mod tests {
 
         app.update();
 
-        let mut events = app
+        let mut messages = app
             .world()
-            .resource::<Events<ToClients<HistoryFor<A>>>>()
-            .iter_current_update_events();
+            .resource::<Messages<ToClients<HistoryFor<A>>>>()
+            .iter_current_update_messages();
         assert_eq!(
             HistoryFor {
                 entity: e1,
@@ -242,9 +251,9 @@ mod tests {
                 past: [(0u8, A(1))].into_iter().collect(),
                 future: [(2u8, A(3)), (3, A(4))].into_iter().collect(),
             },
-            events.next().unwrap().event,
+            messages.next().unwrap().message,
         );
-        assert!(events.next().is_none());
+        assert!(messages.next().is_none());
     }
 
     #[test]
@@ -292,12 +301,15 @@ mod tests {
     }
 
     #[test]
-    fn clears_inputs_without_queue() {
+    fn clears_inputs_empty_queue() {
         let mut app = App::new();
         app.add_systems(Update, load_inputs::<A, Tick>)
             .insert_resource(Tick(5));
 
-        let e1 = app.world_mut().spawn(A(94)).id();
+        let e1 = app
+            .world_mut()
+            .spawn((A(94), InputQueue::<A>::default()))
+            .id();
 
         app.update();
 
@@ -313,22 +325,28 @@ mod tests {
         let e1 = app.world_mut().spawn(InputQueue::<A>::default()).id();
 
         app.init_resource::<ServerMessages>()
-            .add_event::<FromClient<InputHistory<A>>>()
-            .add_event::<ToClients<HistoryFor<A>>>()
-            .add_plugins(InputQueueServerPlugin::<A, Tick>::new(Update.intern()))
+            .add_message::<FromClient<InputHistory<A>>>()
+            .add_message::<ToClients<HistoryFor<A>>>()
+            .add_plugins((
+                StatesPlugin,
+                InputQueueServerPlugin::<A, Tick>::new(Update.intern()),
+            ))
             .insert_resource(Tick(5));
 
-        app.world_mut().send_event_batch([FromClient {
+        app.init_state::<ServerState>();
+        app.insert_resource(NextState::Pending(ServerState::Running));
+
+        app.world_mut().write_message_batch([FromClient {
             client_id: ClientId::Client(e1),
-            event: hist(4, [A(1), A(2), A(3)]),
+            message: hist(4, [A(1), A(2), A(3)]),
         }]);
 
         app.update();
 
-        let mut events = app
+        let mut messages = app
             .world()
-            .resource::<Events<ToClients<HistoryFor<A>>>>()
-            .iter_current_update_events();
+            .resource::<Messages<ToClients<HistoryFor<A>>>>()
+            .iter_current_update_messages();
         assert_eq!(
             HistoryFor {
                 entity: e1,
@@ -336,9 +354,9 @@ mod tests {
                 past: default(),
                 future: [(0u8, A(2)), (1, A(3))].into_iter().collect(),
             },
-            events.next().unwrap().event,
+            messages.next().unwrap().message,
         );
-        assert!(events.next().is_none());
+        assert!(messages.next().is_none());
     }
 
     #[test]
