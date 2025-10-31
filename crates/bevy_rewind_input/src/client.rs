@@ -1,6 +1,6 @@
 //! Logic specific to client apps
 
-use crate::{HistoryFor, InputHistory, InputQueueSet, InputTrait, TickSource};
+use crate::{HistoryFor, InputAuthority, InputHistory, InputQueueSet, InputTrait, TickSource};
 
 use bevy::{ecs::schedule::InternedScheduleLabel, prelude::*};
 use bevy_replicon::{client::ClientSystems, prelude::ClientState};
@@ -50,10 +50,6 @@ impl<T: InputTrait, Tick: TickSource> Plugin for InputQueueClientPlugin<T, Tick>
         );
     }
 }
-
-/// A marker component for entities for which this client has authority to send inputs
-#[derive(Component, Default)]
-pub struct InputAuthority;
 
 fn store_inputs<T: InputTrait, Tick: TickSource>(
     mut query: Query<(&mut InputHistory<T>, &mut T), With<InputAuthority>>,
@@ -207,7 +203,7 @@ mod tests {
 
         // Entities with InputAuthority should be untouched if the history is empty
         let e = app.world().entity(e1);
-        assert_eq!(A(0), *e.get::<A>().unwrap());
+        assert_eq!(A(15), *e.get::<A>().unwrap());
 
         // Entities with InputAuthority should load history
         let e = app.world().entity(e2);

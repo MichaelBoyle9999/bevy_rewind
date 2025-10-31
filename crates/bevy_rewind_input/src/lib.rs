@@ -12,8 +12,6 @@ pub use history::InputHistory;
 
 #[cfg(feature = "client")]
 mod client;
-#[cfg(feature = "client")]
-pub use client::InputAuthority;
 #[cfg(feature = "server")]
 mod server;
 #[cfg(feature = "server")]
@@ -103,6 +101,10 @@ pub trait InputTrait:
         Some(self.clone())
     }
 }
+
+/// A marker component for entities for which this client has authority to send inputs
+#[derive(Component, Default)]
+pub struct InputAuthority;
 
 #[derive(Message, Clone, TypePath, Serialize, Deserialize, PartialEq, Eq, Debug)]
 #[serde(bound(deserialize = "T: for<'de2> serde::Deserialize<'de2>"))]
