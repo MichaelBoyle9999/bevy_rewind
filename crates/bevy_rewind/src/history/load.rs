@@ -10,7 +10,7 @@ use crate::{LoadFrom, Predicted, RollbackLoadSet, RollbackSchedule};
 use bevy::{
     ecs::{
         archetype::Archetype,
-        entity::Entities,
+        entity::{Entities, EntityAllocator},
         entity_disabling::Disabled,
         world::{CommandQueue, EntityMutExcept},
     },
@@ -50,6 +50,7 @@ fn load_and_clear_prediction(
     previous_tick: Res<LoadFrom>,
     global_confirm: Res<ServerMutateTicks>,
     entities: &Entities,
+    e_alloc: &EntityAllocator,
 ) {
     let mut inserts = InsertBatch::new();
     let mut load_queue = CommandQueue::default();
@@ -57,7 +58,7 @@ fn load_and_clear_prediction(
 
     // TODO: Can we par_iter this?
     for (entity, mut predicted, maybe_authoritative, is_disabled) in q.iter_mut() {
-        let mut load_commands = Commands::new_from_entities(&mut load_queue, entities);
+        let mut load_commands = Commands::new_from_entities(&mut load_queue, e_alloc, entities);
         for (&comp_id, pred_hist) in predicted.iter_mut() {
             let &reg_idx = registry.ids.get(&comp_id).unwrap();
             let component = registry.components.get(reg_idx).unwrap();
@@ -141,6 +142,7 @@ fn load_confirmed_authoritative(
     previous_tick: Res<LoadFrom>,
     global_confirm: Res<ServerMutateTicks>,
     entities: &Entities,
+    e_alloc: &EntityAllocator,
 ) {
     let mut inserts = InsertBatch::new();
     let mut load_queue = CommandQueue::default();
@@ -148,7 +150,7 @@ fn load_confirmed_authoritative(
 
     // TODO: Can we par_iter this?
     for (entity, authoritative, confirmed) in q.iter_mut() {
-        let mut load_commands = Commands::new_from_entities(&mut load_queue, entities);
+        let mut load_commands = Commands::new_from_entities(&mut load_queue, e_alloc, entities);
         for (&comp_id, auth_hist) in authoritative.iter() {
             let &reg_idx = registry.ids.get(&comp_id).unwrap();
             let component = registry.components.get(reg_idx).unwrap();
@@ -208,13 +210,14 @@ fn reinsert_predicted(
     registry: Res<RollbackRegistry>,
     previous_tick: Res<LoadFrom>,
     entities: &Entities,
+    e_alloc: &EntityAllocator,
 ) {
     let mut inserts = InsertBatch::new();
     let mut load_queue = CommandQueue::default();
 
     // TODO: Can we par_iter this?
     for (entity, archetype, predicted, authoritative) in q.iter_mut() {
-        let mut load_commands = Commands::new_from_entities(&mut load_queue, entities);
+        let mut load_commands = Commands::new_from_entities(&mut load_queue, e_alloc, entities);
         for (&comp_id, pred_hist) in predicted.iter() {
             if archetype.contains(comp_id) {
                 continue;

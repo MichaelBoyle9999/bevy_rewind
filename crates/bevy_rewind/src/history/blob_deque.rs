@@ -73,7 +73,7 @@ impl BlobDeque {
                 capacity: size.get(),
                 len: 0,
                 start: 0,
-                data: bevy::ptr::dangling_with_align(align),
+                data: NonNull::without_provenance(align),
                 drop,
             }
         } else {
