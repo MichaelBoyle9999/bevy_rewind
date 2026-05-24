@@ -17,7 +17,7 @@ semicolon_if_nothing_returned = "warn"
 
 [workspace.dependencies]
 bevy = { version = "0.18", default-features = false, features = ["bevy_log"] }
-bevy_replicon = { version = "0.38", default-features = false }
+bevy_replicon = { version = "0.39", default-features = false }
 
 bevy_rewind = { path = "crates/bevy_rewind" }
 
