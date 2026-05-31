@@ -15,6 +15,7 @@ workspace = true
 bevy = {workspace = true, features = ["serialize"]}
 
 bevy_replicon.workspace = true
+bevy_rewind = { path = "../bevy_rewind" }
 
 serde.workspace = true
 arraydeque.workspace = true

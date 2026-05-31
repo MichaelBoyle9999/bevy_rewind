@@ -6,6 +6,14 @@ use bevy::{ecs::entity::MapEntities, prelude::*};
 use bevy_replicon::shared::replicon_tick::RepliconTick;
 use serde::{Deserialize, Serialize};
 
+/// Capacity of the per-body input history ring. Must cover at least the
+/// configured rollback window (`bevy_rewind::RollbackFrames`) plus the
+/// application's tick lead, otherwise a wide rollback will resim with
+/// `T::default()` for ticks outside the ring — which would silently lose
+/// movement on a remote body. Public so consumers can put a compile-time
+/// canary against it; see `game/src/networking/components.rs`.
+pub const INPUT_HISTORY_CAPACITY: usize = 20;
+
 /// The input history for an input. Used when sending data to the server, also useful for rollback
 #[derive(Message, Component, Clone, TypePath, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(bound(deserialize = "T: for<'de2> serde::Deserialize<'de2>"))]
@@ -18,7 +26,7 @@ pub struct InputHistory<T: InputTrait> {
 impl<T: InputTrait> Default for InputHistory<T> {
     fn default() -> Self {
         Self {
-            list: std::collections::VecDeque::with_capacity(10),
+            list: std::collections::VecDeque::with_capacity(INPUT_HISTORY_CAPACITY),
             updated_at: default(),
         }
     }
@@ -116,6 +124,12 @@ impl<T: InputTrait> InputHistory<T> {
                     self.list.push_front(T::default());
                 }
                 self.list.push_front(t.clone());
+            } else if self.list.is_empty() {
+                // Degenerate default history (`updated_at == 0`, empty list): the
+                // tick lands "in range" only because `first_tick()` collapses to
+                // `updated_at`. Seed the slot instead of indexing an empty deque.
+                self.updated_at = tick;
+                self.list.push_back(t.clone());
             } else {
                 let index = tick - self.first_tick();
                 self.list[index as usize] = t.clone();
@@ -167,13 +181,16 @@ pub(super) mod tests {
     fn get_repeats() {
         let history = hist(0, [A(1)]);
 
+        // For a repeating input, the latest known value is returned for any
+        // future tick — no hard cap. This is the "last input drives forever
+        // until disconnect" pattern; the dropped cap removes a former tight
+        // 5-tick window that snapped client prediction to default() under
+        // any network jitter.
         for i in 0..5 {
             assert_eq!(Some(A(1)), history.get(Tick(i as u32), true));
         }
-
-        // Values beyond the repeat time should be empty
-        assert_eq!(None, history.get(Tick(6), true));
-        assert_eq!(None, history.get(Tick(2309), true));
+        assert_eq!(Some(A(1)), history.get(Tick(6), true));
+        assert_eq!(Some(A(1)), history.get(Tick(2309), true));
     }
 
     #[test]
@@ -200,8 +217,9 @@ pub(super) mod tests {
 
         assert_eq!(hist(15, [A(1), A(2), A(0), A(0), A(0), A(6)]), history);
 
-        // When the gap is large enough, the old history is cleared
-        history.write(Tick(31), A(10));
+        // When the gap exceeds capacity, the old history is cleared. Gap must
+        // exceed `INPUT_HISTORY_CAPACITY` (20), so write at tick 41 (gap 21).
+        history.write(Tick(41), A(10));
         assert_eq!(1, history.list.len());
     }
 

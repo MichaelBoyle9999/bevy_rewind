@@ -186,6 +186,16 @@ struct SimulationScheduleLabel(Interned<dyn ScheduleLabel>);
 #[derive(Resource)]
 pub struct AlreadyLoaded;
 
+/// Present only while [`trigger_rollback`] is replaying past ticks (i.e. while
+/// the user's simulation schedule is running as a *resim*, not a forward step).
+/// Systems that distinguish "load historical input" (resim) from "use live
+/// input" (forward) can gate on `Option<Res<Resimulating>>`. Inserted just
+/// before each resim tick's `PreResimulation`/schedule/`PostResimulation`
+/// triple and removed immediately after, so neither the initial `Rollback`
+/// state-load nor `BackToPresent` is included.
+#[derive(Resource)]
+pub struct Resimulating;
+
 fn trigger_rollback<Tick: TickSource>(world: &mut World) {
     let target = std::mem::take(&mut **world.resource_mut::<RollbackTarget>());
     let schedule = **world.resource::<SimulationScheduleLabel>();
@@ -219,6 +229,11 @@ fn trigger_rollback<Tick: TickSource>(world: &mut World) {
         world.insert_resource(LoadFrom(RepliconTick::new(tick.get().saturating_sub(1))));
         world.insert_resource(Tick::from(tick));
 
+        // Mark resim active so input/state systems can distinguish "replay from
+        // history" from "drive from live input". Scoped to the
+        // PreResim → schedule → PostResim triple per tick.
+        world.insert_resource(Resimulating);
+
         // Run PreResimulation
         world.run_schedule(RollbackSchedule::PreResimulation);
         world.remove_resource::<AlreadyLoaded>();
@@ -228,6 +243,8 @@ fn trigger_rollback<Tick: TickSource>(world: &mut World) {
 
         // Run PostResimulation
         world.run_schedule(RollbackSchedule::PostResimulation);
+
+        world.remove_resource::<Resimulating>();
     }
 
     world.run_schedule(RollbackSchedule::BackToPresent);
@@ -649,6 +666,13 @@ pub enum RollbackSchedule {
     BackToPresent,
 }
 
+/// Production default for [`RollbackFrames`]. Public so consumers can put a
+/// compile-time canary against it; see `game/src/networking/components.rs`.
+pub const DEFAULT_ROLLBACK_FRAMES: u8 = 15;
+
+/// In-test default for [`RollbackFrames`], smaller to keep unit-test histories tight.
+pub const TEST_ROLLBACK_FRAMES: u8 = 5;
+
 /// A resource specifying the maximum number of rollback frames that should be stored.
 /// Because the current frame is always included and we need to load data from the previous
 /// frame, the history size is always 2 higher than thus number
@@ -658,9 +682,9 @@ pub struct RollbackFrames(u8);
 impl Default for RollbackFrames {
     fn default() -> Self {
         #[cfg(test)]
-        return RollbackFrames(5);
+        return RollbackFrames(TEST_ROLLBACK_FRAMES);
         #[cfg(not(test))]
-        return RollbackFrames(15);
+        return RollbackFrames(DEFAULT_ROLLBACK_FRAMES);
     }
 }
 

@@ -8,7 +8,7 @@ mod queue;
 pub use queue::InputQueue;
 
 mod history;
-pub use history::InputHistory;
+pub use history::{InputHistory, INPUT_HISTORY_CAPACITY};
 
 #[cfg(feature = "client")]
 mod client;
@@ -93,9 +93,16 @@ pub trait InputTrait:
     /// Whether or not the input repeats
     fn repeats() -> bool;
 
-    /// Get a repeated copy of this input
-    fn repeated(&self, since: u32) -> Option<Self> {
-        if !Self::repeats() || since > 5 {
+    /// Get a repeated copy of this input for use when no exact-tick input is
+    /// available. When [`Self::repeats`] is `true`, the latest known input is
+    /// repeated *indefinitely* — this matches the "last input drives forever
+    /// until disconnect is detected" pattern most heavily-networked games use,
+    /// and is what client-side prediction needs to keep moving smoothly across
+    /// arbitrary network jitter without snapping to a `default()` fallback.
+    /// Implementors that want a hard cap can override this with their own
+    /// `since`-aware logic.
+    fn repeated(&self, _since: u32) -> Option<Self> {
+        if !Self::repeats() {
             return None;
         }
         Some(self.clone())

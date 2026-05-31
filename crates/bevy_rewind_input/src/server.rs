@@ -6,6 +6,7 @@ use crate::{
     HistoryFor, InputAuthority, InputHistory, InputQueue, InputQueueSet, InputTrait, TickSource,
 };
 
+use arrayvec::ArrayVec;
 use bevy::{ecs::schedule::InternedScheduleLabel, prelude::*};
 use bevy_replicon::prelude::*;
 
@@ -95,17 +96,34 @@ fn receive_inputs<T: InputTrait, Tick: TickSource>(
 
 fn send_inputs<T: InputTrait, Tick: TickSource>(
     mut messages: MessageWriter<ToClients<HistoryFor<T>>>,
-    query: Query<(Entity, &InputQueue<T>)>,
+    query: Query<(Entity, &InputQueue<T>, Option<&T>, Has<InputAuthority>)>,
     cur_tick: Res<Tick>,
 ) {
     let cur_tick = (*cur_tick).into();
-    for (entity, queue) in query.iter() {
+    for (entity, queue, current, authority) in query.iter() {
         if queue.past().any(|(t, _)| *t > cur_tick) || queue.queue().any(|(t, _)| *t < cur_tick) {
             warn_once!(
                 "({:?}) Queue has inputs with impossible ticks: {:?}",
                 cur_tick.get(),
                 queue
             );
+        }
+        let mut future: ArrayVec<(u8, T), 7> = queue
+            .queue()
+            .take(7)
+            .filter(|(tick, _)| tick.get() >= cur_tick.get())
+            .map(|(tick, t)| ((tick.get() - cur_tick.get()) as u8, t.clone()))
+            .collect();
+        // A listen-server host drives its own (`InputAuthority`) body from live input
+        // that never enters the queue: the host never sends itself a `FromClient`
+        // message, so `receive_inputs` never feeds this body and the queue stays empty.
+        // Broadcast its current input directly so clients can replay the host's movement
+        // instead of seeing a frozen body. Guarded on an empty future so a body whose
+        // input *does* arrive via the queue (a remote client's) is untouched.
+        if authority && future.is_empty() {
+            if let Some(input) = current {
+                future.push((0, input.clone()));
+            }
         }
         messages.write(ToClients {
             mode: SendMode::Broadcast,
@@ -116,12 +134,7 @@ fn send_inputs<T: InputTrait, Tick: TickSource>(
                     .past()
                     .map(|(tick, t)| ((cur_tick.get() - tick.get()) as u8, t.clone()))
                     .collect(),
-                future: queue
-                    .queue()
-                    .take(7)
-                    .filter(|(tick, _)| tick.get() >= cur_tick.get())
-                    .map(|(tick, t)| ((tick.get() - cur_tick.get()) as u8, t.clone()))
-                    .collect(),
+                future,
             },
         });
     }
@@ -380,8 +393,10 @@ mod tests {
         let e = app.world().entity(e1);
         assert_eq!(A(2), *e.get::<A>().unwrap());
 
-        // All the data was old, and could no longer be repeated
+        // The latest known input is repeated indefinitely (the former 5-tick
+        // cap was dropped because it produced default()-fallback prediction
+        // bugs under any jitter).
         let e = app.world().entity(e2);
-        assert_eq!(A(0), *e.get::<A>().unwrap());
+        assert_eq!(A(1), *e.get::<A>().unwrap());
     }
 }

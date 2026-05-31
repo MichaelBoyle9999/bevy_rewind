@@ -4,6 +4,7 @@ use crate::{HistoryFor, InputAuthority, InputHistory, InputQueueSet, InputTrait,
 
 use bevy::{ecs::schedule::InternedScheduleLabel, prelude::*};
 use bevy_replicon::{client::ClientSystems, prelude::ClientState};
+use bevy_rewind::Resimulating;
 
 pub(super) struct InputQueueClientPlugin<T: InputTrait, Tick: TickSource> {
     schedule: InternedScheduleLabel,
@@ -74,8 +75,21 @@ fn store_inputs<T: InputTrait, Tick: TickSource>(
 fn load_inputs<T: InputTrait, Tick: TickSource>(
     mut query: Query<(&InputHistory<T>, &mut T, Has<InputAuthority>)>,
     tick: Res<Tick>,
+    resimulating: Option<Res<Resimulating>>,
 ) {
+    let in_resim = resimulating.is_some();
     for (hist, mut input, authority) in query.iter_mut() {
+        // During forward simulation, the local-authority body's input is the
+        // value the application's per-tick capture wrote at the start of this
+        // fixed step. Loading from history here would overwrite it with the
+        // server's round-tripped view of this client's earlier inputs, which
+        // lags by `CLIENT_TICK_LEAD` and starts a (0,0) feedback loop the first
+        // time history is fed back into a body whose live input is non-zero.
+        // During resim, capture doesn't run, so history *is* the authoritative
+        // source for past ticks and we load normally.
+        if authority && !in_resim {
+            continue;
+        }
         let i = hist.get(*tick, !authority);
         if i.is_none() && authority {
             continue;

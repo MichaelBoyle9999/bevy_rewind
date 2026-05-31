@@ -157,8 +157,9 @@ mod tests {
         assert_eq!(queue.next(Tick(11)), Some(A(0)));
         // Still repeating
         assert_eq!(queue.next(Tick(15)), Some(A(0)));
-        // Now it should no longer repeat
-        assert_eq!(queue.next(Tick(16)), None);
+        // Repeating indefinitely (formerly capped at 5 ticks; the cap drove
+        // jitter-induced default()-fallback bugs in client prediction).
+        assert_eq!(queue.next(Tick(16)), Some(A(0)));
         // And now we should get the next input
         assert_eq!(queue.next(Tick(17)), Some(A(7)));
     }
