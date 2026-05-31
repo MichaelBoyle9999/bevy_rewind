@@ -9,6 +9,7 @@ use crate::{
 use arrayvec::ArrayVec;
 use bevy::{ecs::schedule::InternedScheduleLabel, prelude::*};
 use bevy_replicon::prelude::*;
+use bevy_rewind::RollbackTarget;
 
 pub(super) struct InputQueueServerPlugin<T: InputTrait, Tick: TickSource> {
     schedule: InternedScheduleLabel,
@@ -78,6 +79,7 @@ fn receive_inputs<T: InputTrait, Tick: TickSource>(
     mut messages: MessageReader<FromClient<InputHistory<T>>>,
     mut query: Query<&mut InputQueue<T>>,
     cur_tick: Res<Tick>,
+    mut rollback_target: ResMut<RollbackTarget>,
 ) {
     for FromClient { client_id, message } in messages.read() {
         let Some(client_entity) = client_id.entity() else {
@@ -90,7 +92,19 @@ fn receive_inputs<T: InputTrait, Tick: TickSource>(
         let Ok(mut input_queue) = query.get_mut(entity) else {
             continue;
         };
-        input_queue.add(*cur_tick, message);
+        if let Some(target) = input_queue.add(*cur_tick, message) {
+            // Eager rollback: a client input arrived stamped for a tick in our
+            // past. Request a rollback to that tick so the resim picks up the
+            // newly-merged late input. Per-system order: this runs in PreUpdate;
+            // `calculate_rollback_target` runs later in `RunFixedMainLoop` and
+            // both clamps to the rollback window and takes a min over any
+            // replicon-confirm-driven target, so writing the raw past tick here
+            // composes correctly with state-confirm rollbacks.
+            **rollback_target = Some(match **rollback_target {
+                Some(prev) => prev.min(target),
+                None => target,
+            });
+        }
     }
 }
 
@@ -101,9 +115,9 @@ fn send_inputs<T: InputTrait, Tick: TickSource>(
 ) {
     let cur_tick = (*cur_tick).into();
     for (entity, queue, current, authority) in query.iter() {
-        if queue.past().any(|(t, _)| *t > cur_tick) || queue.queue().any(|(t, _)| *t < cur_tick) {
+        if queue.past().any(|(t, _)| *t > cur_tick) {
             warn_once!(
-                "({:?}) Queue has inputs with impossible ticks: {:?}",
+                "({:?}) Queue has past inputs with impossible (future) ticks: {:?}",
                 cur_tick.get(),
                 queue
             );
@@ -174,6 +188,7 @@ mod tests {
 
         app.add_message::<FromClient<InputHistory<A>>>()
             .add_systems(Update, receive_inputs::<A, Tick>)
+            .init_resource::<RollbackTarget>()
             .insert_resource(Tick(5));
 
         app.world_mut().write_message_batch([
@@ -203,8 +218,15 @@ mod tests {
         );
 
         let [e1, e2, e3, e4] = app.world().get_entity([e1, e2, e3, e4]).unwrap();
+        // e1's history starts at tick 4 (one tick in the past relative to
+        // cur_tick=5). Under the eager-rollback contract the past tick is
+        // accepted into the queue rather than dropped.
         assert_eq!(
-            vec![&(Tick(5).into(), A(2)), &(Tick(6).into(), A(3))],
+            vec![
+                &(Tick(4).into(), A(1)),
+                &(Tick(5).into(), A(2)),
+                &(Tick(6).into(), A(3)),
+            ],
             e1.get::<InputQueue<A>>()
                 .unwrap()
                 .queue()
@@ -235,6 +257,85 @@ mod tests {
         );
         // e4 isn't the target itself and thus received nothing
         assert_eq!(0, e4.get::<InputQueue<A>>().unwrap().queue().count());
+
+        // The past-tick history from e1 (hist(4, ...)) should have requested a
+        // rollback to tick 4. The other two messages (hist(5,..) and hist(6,..))
+        // are at or in the future and don't request rollback.
+        assert_eq!(
+            Some(RepliconTick::new(4)),
+            **app.world().resource::<RollbackTarget>()
+        );
+    }
+
+    /// Multiple past-input messages in one frame collapse to the earliest tick
+    /// via min, and an already-present (state-confirm-driven) rollback target
+    /// is preserved when it's earlier than any incoming past input. This is
+    /// the "compose with other rollback triggers" invariant of `receive_inputs`.
+    #[test]
+    fn receive_inputs_takes_min_with_existing_rollback_target() {
+        let mut app = App::new();
+
+        let e_late = app.world_mut().spawn(InputQueue::<A>::default()).id();
+
+        app.add_message::<FromClient<InputHistory<A>>>()
+            .add_systems(Update, receive_inputs::<A, Tick>)
+            .init_resource::<RollbackTarget>()
+            .insert_resource(Tick(20));
+
+        // Seed a pre-existing rollback target (as if a state confirm had already
+        // requested it). It is *earlier* than any incoming past input, so the
+        // min should preserve it.
+        **app.world_mut().resource_mut::<RollbackTarget>() = Some(RepliconTick::new(7));
+
+        app.world_mut().write_message_batch([FromClient {
+            client_id: ClientId::Client(e_late),
+            message: hist(15, [A(1), A(2), A(3)]),
+        }]);
+
+        app.update();
+
+        assert_eq!(
+            Some(RepliconTick::new(7)),
+            **app.world().resource::<RollbackTarget>(),
+            "an earlier pre-existing target must not be raised by a later past input",
+        );
+
+        // Now write a message whose past tick is earlier than the existing
+        // target — the min should lower the target to the new past tick.
+        app.world_mut().write_message(FromClient {
+            client_id: ClientId::Client(e_late),
+            message: hist(3, [A(0), A(0), A(0), A(0)]),
+        });
+        app.update();
+
+        assert_eq!(
+            Some(RepliconTick::new(3)),
+            **app.world().resource::<RollbackTarget>(),
+            "an earlier incoming past input must lower an existing target",
+        );
+    }
+
+    /// A future-only input message (history fully at or after `cur_tick`)
+    /// must not write to `RollbackTarget`. The eager-rollback path is
+    /// strictly opt-in on past arrivals; future arrivals follow the legacy
+    /// "queue and apply on tick advance" path.
+    #[test]
+    fn receive_inputs_does_not_request_rollback_for_future_input() {
+        let mut app = App::new();
+        let e = app.world_mut().spawn(InputQueue::<A>::default()).id();
+
+        app.add_message::<FromClient<InputHistory<A>>>()
+            .add_systems(Update, receive_inputs::<A, Tick>)
+            .init_resource::<RollbackTarget>()
+            .insert_resource(Tick(5));
+
+        app.world_mut().write_message(FromClient {
+            client_id: ClientId::Client(e),
+            message: hist(5, [A(1), A(2), A(3)]),
+        });
+        app.update();
+
+        assert_eq!(None, **app.world().resource::<RollbackTarget>());
     }
 
     #[test]
@@ -338,6 +439,7 @@ mod tests {
         let e1 = app.world_mut().spawn(InputQueue::<A>::default()).id();
 
         app.init_resource::<ServerMessages>()
+            .init_resource::<RollbackTarget>()
             .add_message::<FromClient<InputHistory<A>>>()
             .add_message::<ToClients<HistoryFor<A>>>()
             .add_plugins((

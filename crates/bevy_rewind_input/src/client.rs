@@ -83,10 +83,10 @@ fn load_inputs<T: InputTrait, Tick: TickSource>(
         // value the application's per-tick capture wrote at the start of this
         // fixed step. Loading from history here would overwrite it with the
         // server's round-tripped view of this client's earlier inputs, which
-        // lags by `CLIENT_TICK_LEAD` and starts a (0,0) feedback loop the first
-        // time history is fed back into a body whose live input is non-zero.
-        // During resim, capture doesn't run, so history *is* the authoritative
-        // source for past ticks and we load normally.
+        // lags by one network round-trip and starts a (0,0) feedback loop the
+        // first time history is fed back into a body whose live input is
+        // non-zero. During resim, capture doesn't run, so history *is* the
+        // authoritative source for past ticks and we load normally.
         if authority && !in_resim {
             continue;
         }

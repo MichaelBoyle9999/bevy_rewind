@@ -29,31 +29,55 @@ impl<T: InputTrait> InputQueue<T> {
         self.queue.iter()
     }
 
-    pub(crate) fn add(&mut self, tick: impl Into<RepliconTick>, history: &InputHistory<T>) {
-        let next_accepted = RepliconTick::new(
-            tick.into().get().max(
-                self.queue
-                    .back()
-                    .map(|(tick, _)| tick.get() + 1)
-                    .unwrap_or_default(),
-            ),
-        );
-        if history.updated_at() < next_accepted {
-            return;
+    /// Merge an incoming input history into the queue. Past-tick history
+    /// (entries stamped for ticks `< cur_tick`) is accepted, not discarded:
+    /// late inputs are placed into the queue at their stamped tick so that
+    /// the eager-rollback path can resimulate from the earliest changed tick.
+    /// Returns the earliest past tick (i.e. tick `< cur_tick`) the history
+    /// wrote, so the caller can request a rollback to that tick.
+    ///
+    /// Conflict policy: on tick overlap, the incoming history overrides any
+    /// existing queue entry — the newest message has the most-recent client
+    /// state for that tick. Capacity overrun keeps the newest ticks.
+    pub(crate) fn add(
+        &mut self,
+        tick: impl Into<RepliconTick>,
+        history: &InputHistory<T>,
+    ) -> Option<RepliconTick> {
+        if history.is_empty() {
+            return None;
         }
+        let cur_tick = tick.into();
+        let history_first = history.first_tick();
+        let history_last = history.updated_at();
 
-        let first_tick = history.first_tick();
-        let offset = next_accepted.get().saturating_sub(first_tick.get()) as usize;
-        let remaining_capacity = self.queue.capacity() - self.queue.len();
+        let earliest_past = (history_first < cur_tick).then_some(history_first);
 
-        self.queue.extend_back(
+        let existing: Vec<(RepliconTick, T)> = self
+            .queue
+            .drain(..)
+            // Drop existing slots overlapping the history's range — history wins on conflict.
+            .filter(|(t, _)| *t < history_first || *t > history_last)
+            .collect();
+
+        let mut combined: Vec<(RepliconTick, T)> =
+            Vec::with_capacity(existing.len() + history.iter().count());
+        combined.extend(existing);
+        combined.extend(
             history
                 .iter()
                 .enumerate()
-                .skip(offset)
-                .take(remaining_capacity)
-                .map(|(i, t)| (first_tick + i as u32, t.clone())),
+                .map(|(i, t)| (history_first + i as u32, t.clone())),
         );
+        combined.sort_by_key(|(t, _)| t.get());
+
+        let cap = self.queue.capacity();
+        let skip = combined.len().saturating_sub(cap);
+        for entry in combined.into_iter().skip(skip) {
+            let _ = self.queue.push_back(entry);
+        }
+
+        earliest_past
     }
 
     pub(crate) fn next(&mut self, tick: impl Into<RepliconTick>) -> Option<T> {
@@ -103,32 +127,50 @@ mod tests {
     }
 
     #[test]
-    fn queue_skips_older_inputs() {
+    fn queue_accepts_past_inputs_and_reports_earliest() {
         let mut queue = InputQueue::<A>::default();
 
         // List starts empty
         assert_eq!(queue.queue.len(), 0);
 
-        // If the entire history is from before the current tick, it is ignored
-        queue.add(Tick(10), &hist(7, [A(79), A(80)]));
-        assert_eq!(queue.queue.len(), 0);
-
-        // When adding items to an empty queue, only the current or future items get added
-        queue.add(Tick(10), &hist(9, [A(0), A(1), A(2)]));
+        // A history entirely in the past is now accepted (was dropped under the
+        // legacy "queue holds only future ticks" design). The caller uses the
+        // returned earliest past tick to request a rollback.
+        let earliest = queue.add(Tick(10), &hist(7, [A(79), A(80)]));
+        assert_eq!(Some(RepliconTick::new(7)), earliest);
         assert_eq!(queue.queue.len(), 2);
+        assert_eq!(
+            ArrayDeque::from([
+                (RepliconTick::new(7), A(79)),
+                (RepliconTick::new(8), A(80)),
+            ]),
+            queue.queue
+        );
 
-        // When adding items to a queue that has items, only missing ticks get added
-        queue.add(Tick(10), &hist(10, [A(29), A(42), A(3)]));
-        assert_eq!(queue.queue.len(), 3);
-
-        // If for whatever reason there is a gap nothing should break
-        queue.add(Tick(10), &hist(15, [A(6), A(7)]));
+        // History straddling cur_tick: entries 9 (past), 10, 11 (future) are
+        // merged. Earliest past is the only past tick this message brought.
+        let earliest = queue.add(Tick(10), &hist(9, [A(0), A(1), A(2)]));
+        assert_eq!(Some(RepliconTick::new(9)), earliest);
         assert_eq!(queue.queue.len(), 5);
+
+        // Conflict policy: history wins on overlapping ticks. Ticks 10 and 11
+        // already present, but they get overwritten with the latest values.
+        let earliest = queue.add(Tick(10), &hist(10, [A(29), A(42), A(3)]));
+        assert_eq!(None, earliest);
+        assert_eq!(queue.queue.len(), 6);
+
+        // Disjoint future range merges cleanly with no past write.
+        let earliest = queue.add(Tick(10), &hist(15, [A(6), A(7)]));
+        assert_eq!(None, earliest);
+        assert_eq!(queue.queue.len(), 8);
 
         assert_eq!(
             ArrayDeque::from([
-                (RepliconTick::new(10), A(1)),
-                (RepliconTick::new(11), A(2)),
+                (RepliconTick::new(7), A(79)),
+                (RepliconTick::new(8), A(80)),
+                (RepliconTick::new(9), A(0)),
+                (RepliconTick::new(10), A(29)),
+                (RepliconTick::new(11), A(42)),
                 (RepliconTick::new(12), A(3)),
                 (RepliconTick::new(15), A(6)),
                 (RepliconTick::new(16), A(7)),
