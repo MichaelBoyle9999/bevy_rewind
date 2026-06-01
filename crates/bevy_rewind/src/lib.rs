@@ -197,16 +197,24 @@ pub struct AlreadyLoaded;
 pub struct Resimulating;
 
 fn trigger_rollback<Tick: TickSource>(world: &mut World) {
-    let target = std::mem::take(&mut **world.resource_mut::<RollbackTarget>());
     let schedule = **world.resource::<SimulationScheduleLabel>();
 
     // Swap to Time<Fixed>
     *world.resource_mut::<Time>() = world.resource::<Time<Fixed>>().as_generic();
 
     let real_tick: RepliconTick = (*world.resource::<Tick>()).into();
-    let start = target.unwrap();
+    // Read but do not yet clear the target so `PreRollback` systems can inspect it
+    // — e.g. `bevy_rewind_entity_management::disable_unspawned_during_rollback`
+    // needs the rollback target to mark `Predicted` entities spawned after that
+    // tick as `Unspawned` before `Rollback`'s `load_and_clear_prediction` runs.
+    // `rollback_requested` is the gate; this resolves to `Some` by construction.
+    let start = (**world.resource::<RollbackTarget>())
+        .expect("rollback_requested gates trigger_rollback; target must be Some");
 
     world.run_schedule(RollbackSchedule::PreRollback);
+
+    // Clear the request now that PreRollback has had its chance to read it.
+    **world.resource_mut::<RollbackTarget>() = None;
 
     world.insert_resource(LoadFrom(RepliconTick::new(start.get().saturating_sub(1))));
     world.insert_resource(Tick::from(start));

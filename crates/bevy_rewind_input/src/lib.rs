@@ -77,6 +77,12 @@ pub enum InputQueueSet {
 }
 
 /// A trait for an Input that can be registered via [`InputQueuePlugin`]
+///
+/// The `PartialEq` bound exists so [`InputQueue::add`] can decide whether an
+/// incoming past-tick history entry is value-novel (different from what's
+/// already on file for that tick) vs a duplicate resend. Without this, every
+/// per-tick history broadcast from the client would trigger a fresh rollback
+/// request on the server even when no input actually changed.
 pub trait InputTrait:
     Component<Mutability = Mutable>
     + Sync
@@ -85,6 +91,7 @@ pub trait InputTrait:
     + Clone
     + std::fmt::Debug
     + MapEntities
+    + PartialEq
     + Serialize
     + for<'a> Deserialize<'a>
     + TypePath

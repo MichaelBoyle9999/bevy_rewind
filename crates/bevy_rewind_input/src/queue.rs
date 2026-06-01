@@ -33,8 +33,18 @@ impl<T: InputTrait> InputQueue<T> {
     /// (entries stamped for ticks `< cur_tick`) is accepted, not discarded:
     /// late inputs are placed into the queue at their stamped tick so that
     /// the eager-rollback path can resimulate from the earliest changed tick.
-    /// Returns the earliest past tick (i.e. tick `< cur_tick`) the history
-    /// wrote, so the caller can request a rollback to that tick.
+    /// Returns the earliest past tick whose value is *novel* — i.e. it
+    /// differs from what was already on file for that tick, or it lands in
+    /// a gap past anything previously consumed. A history that re-sends the
+    /// same values for the same past ticks returns `None`, so no rollback is
+    /// requested.
+    ///
+    /// Why this matters: at zero network latency the client still ships its
+    /// full `InputHistory` ring (20 ticks) every tick, and system-pipeline
+    /// delay means every message arrives stamped at `< cur_tick`. Without the
+    /// novelty check the server would request a fresh rollback every tick,
+    /// every tick, even when no input has actually changed — the chronic
+    /// 13-tick floor-clamp the zero-latency smoothness tests caught.
     ///
     /// Conflict policy: on tick overlap, the incoming history overrides any
     /// existing queue entry — the newest message has the most-recent client
@@ -51,7 +61,33 @@ impl<T: InputTrait> InputQueue<T> {
         let history_first = history.first_tick();
         let history_last = history.updated_at();
 
-        let earliest_past = (history_first < cur_tick).then_some(history_first);
+        // Highest tick we've ever called `next()` for. Anything <= this is
+        // either already consumed or was skipped as late (and either way the
+        // simulator has moved past it). If `past` is empty (no `next()` yet),
+        // any past-tick info is potentially novel.
+        let highest_consumed = self.past.back().map(|(t, _)| t.get());
+
+        let mut earliest_novel: Option<RepliconTick> = None;
+        for (i, new_val) in history.iter().enumerate() {
+            let t = RepliconTick::new(history_first.get() + i as u32);
+            if t >= cur_tick {
+                break;
+            }
+            let existing: Option<&T> = self
+                .past
+                .iter()
+                .find(|(pt, _)| *pt == t)
+                .map(|(_, v)| v)
+                .or_else(|| self.queue.iter().find(|(qt, _)| *qt == t).map(|(_, v)| v));
+            let is_novel = match existing {
+                Some(v) => v != new_val,
+                None => highest_consumed.is_none_or(|hc| t.get() > hc),
+            };
+            if is_novel {
+                earliest_novel = Some(t);
+                break;
+            }
+        }
 
         let existing: Vec<(RepliconTick, T)> = self
             .queue
@@ -77,7 +113,7 @@ impl<T: InputTrait> InputQueue<T> {
             let _ = self.queue.push_back(entry);
         }
 
-        earliest_past
+        earliest_novel
     }
 
     pub(crate) fn next(&mut self, tick: impl Into<RepliconTick>) -> Option<T> {
@@ -228,6 +264,68 @@ mod tests {
         queue.add(Tick(9), &hist(9, [A(0), A(1), A(2)]));
 
         assert_eq!(queue.next(Tick(10)), Some(A(1)));
+    }
+
+    #[test]
+    fn queue_does_not_report_same_value_resends_as_novel() {
+        // First add: queue empty, A(7) at tick 5 is novel — earliest past tick.
+        let mut queue = InputQueue::<A>::default();
+        assert_eq!(
+            Some(RepliconTick::new(5)),
+            queue.add(Tick(10), &hist(5, [A(7), A(7), A(7), A(7), A(7)])),
+        );
+        // Second add: same value for same ticks. No rollback should be requested.
+        assert_eq!(
+            None,
+            queue.add(Tick(10), &hist(5, [A(7), A(7), A(7), A(7), A(7)])),
+        );
+    }
+
+    #[test]
+    fn queue_reports_only_the_earliest_differing_past_tick_as_novel() {
+        // Seed the queue with [(5, A(1)), (6, A(2)), (7, A(3))].
+        let mut queue = InputQueue::<A>::default();
+        queue.add(Tick(10), &hist(5, [A(1), A(2), A(3)]));
+        // Resend with ticks 5 and 6 unchanged but tick 7's value flipped.
+        // The earliest novel past tick is 7, not 5.
+        assert_eq!(
+            Some(RepliconTick::new(7)),
+            queue.add(Tick(10), &hist(5, [A(1), A(2), A(99)])),
+        );
+    }
+
+    #[test]
+    fn queue_does_not_report_already_consumed_evicted_ticks_as_novel() {
+        // Seed and consume forward through tick 9 so `past` advances to 9.
+        let mut queue = InputQueue::<A>::default();
+        queue.add(Tick(5), &hist(5, [A(1), A(2), A(3), A(4), A(5)]));
+        // Consume through tick 9. Past ring (cap 3) ends up holding ticks 7..9.
+        for t in 5..=9 {
+            queue.next(Tick(t));
+        }
+        // History stamped from tick 5 still includes ticks 5 and 6 — those have
+        // been evicted from `past` and are older than the highest consumed tick,
+        // so the simulator has moved past them. Not novel.
+        assert_eq!(
+            None,
+            queue.add(Tick(15), &hist(5, [A(1), A(2), A(3), A(4), A(5)])),
+        );
+    }
+
+    #[test]
+    fn queue_reports_unseen_past_tick_after_some_consumption_as_novel() {
+        // Seed [(5, A(1)), (6, A(2))], consume to tick 6 → past holds (5, _) and (6, _).
+        let mut queue = InputQueue::<A>::default();
+        queue.add(Tick(5), &hist(5, [A(1), A(2)]));
+        queue.next(Tick(5));
+        queue.next(Tick(6));
+        // Now an incoming message backfills tick 7 (between highest_consumed=6
+        // and cur_tick=10) with a brand new value. That's novel — we never saw
+        // tick 7 before.
+        assert_eq!(
+            Some(RepliconTick::new(7)),
+            queue.add(Tick(10), &hist(7, [A(42)])),
+        );
     }
 
     #[test]

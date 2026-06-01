@@ -1,18 +1,14 @@
 //! A crate handling entity management in a way that plays nice with rollback.
-//! Based on features can also serve as a server shim.
+//!
+//! The plugin is symmetric across client and server (both sides run rollbacks,
+//! so both need the spawn-rollback machinery). The despawn flow that converts a
+//! server-replicated despawn into a `Despawned`-then-disabled retention is also
+//! shared and gated at runtime on `world_has_authority` rather than at compile
+//! time, so the same plugin compiles and runs on either side.
 
-// TODO: Tests
-
-#[cfg(feature = "client")]
 mod client;
 
-#[cfg(feature = "client")]
 pub use client::{Despawned, EntityManagementPlugin, Unspawned};
-
-#[cfg(not(feature = "client"))]
-mod server_shim;
-#[cfg(not(feature = "client"))]
-pub use server_shim::EntityManagementPlugin;
 
 use std::marker::PhantomData;
 
@@ -22,6 +18,15 @@ use bevy::{
     prelude::*,
 };
 use bevy_replicon::shared::replicon_tick::RepliconTick;
+
+/// The tick at which a [`bevy_rewind::Predicted`] entity was first spawned. Stamped
+/// automatically by an observer the [`EntityManagementPlugin`] registers, reading
+/// from the configured `TickSource`. The observer no-ops during a `Resimulating`
+/// resim so the original spawn tick survives rollback-driven re-spawns of the same
+/// entity (e.g. via `reuse_spawn` on the client). Once set, it is preserved for the
+/// life of the entity.
+#[derive(Component, Clone, Copy, Deref, Debug, PartialEq, Eq)]
+pub struct SpawnedAt(pub RepliconTick);
 
 /// A plugin adding handling of entity reuse for a specific [`SpawnReason`]
 pub struct SpawnPlugin<Reason: SpawnReason>(PhantomData<Reason>);
@@ -44,23 +49,19 @@ struct ToRemove(HashSet<Entity>);
 
 /// A system param used to track spawned entities
 #[derive(SystemParam)]
-#[cfg_attr(not(feature = "client"), allow(unused))]
 pub struct Spawned<'w, Reason: SpawnReason> {
     entities: ResMut<'w, SpawnedEntities<Reason>>,
     to_remove: Res<'w, ToRemove>,
-    #[cfg(feature = "client")]
     authority: Option<Res<'w, State<bevy_replicon::prelude::ClientState>>>,
 }
 
 #[derive(Debug)]
-#[cfg_attr(not(feature = "client"), allow(unused))]
 struct SpawnedEntity {
     id: Entity,
     last_spawned: RepliconTick,
 }
 
 #[derive(Resource, Debug)]
-#[cfg_attr(not(feature = "client"), allow(unused))]
 struct SpawnedEntities<Reason: SpawnReason>(HashMap<Reason, SpawnedEntity>);
 
 impl<Reason: SpawnReason> Default for SpawnedEntities<Reason> {
