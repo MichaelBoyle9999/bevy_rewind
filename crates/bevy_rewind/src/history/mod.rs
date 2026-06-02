@@ -15,6 +15,8 @@ pub use predicted::PredictedHistory;
 
 mod batch;
 mod load;
+pub use load::lift_remote_replicated;
+pub(crate) use load::{DivergenceQuery, rollback_would_change_state};
 
 #[cfg(test)]
 mod test_utils;
