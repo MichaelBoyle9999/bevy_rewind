@@ -3,12 +3,13 @@
 use std::marker::PhantomData;
 
 use crate::{
-    HistoryFor, InputAuthority, InputHistory, InputQueue, InputQueueSet, InputTrait, TickSource,
+    ConfirmedHorizon, HistoryFor, InputAuthority, InputHistory, InputQueue, InputQueueSet,
+    InputTrait, TickSource,
 };
 
 use arrayvec::ArrayVec;
 use bevy::{ecs::schedule::InternedScheduleLabel, prelude::*};
-use bevy_replicon::prelude::*;
+use bevy_replicon::{prelude::*, shared::replicon_tick::RepliconTick};
 use bevy_rewind::RollbackTarget;
 
 pub(super) struct InputQueueServerPlugin<T: InputTrait, Tick: TickSource> {
@@ -28,7 +29,7 @@ impl<T: InputTrait, Tick: TickSource> InputQueueServerPlugin<T, Tick> {
 
 impl<T: InputTrait, Tick: TickSource> Plugin for InputQueueServerPlugin<T, Tick> {
     fn build(&self, app: &mut App) {
-        app.add_systems(
+        app.init_resource::<ConfirmedHorizon>().add_systems(
             PreUpdate,
             receive_inputs::<T, Tick>
                 .run_if(in_state(ServerState::Running))
@@ -157,9 +158,21 @@ fn send_inputs<T: InputTrait, Tick: TickSource>(
 fn load_inputs<T: InputTrait, Tick: TickSource>(
     mut query: Query<(&mut T, &mut InputQueue<T>, Has<InputAuthority>)>,
     tick: Res<Tick>,
+    confirmed: Res<ConfirmedHorizon>,
 ) {
+    let sim_tick: RepliconTick = (*tick).into();
+    // A remote (non-authority) body loads input at `min(sim_tick, confirmed)`: real
+    // queued input at/before the confirmed tick (so resim reconstructs the confirmed
+    // ticks correctly), and the confirmed input repeated beyond it (the lead window,
+    // `confirmed < sim_tick ≤ present`) — so the body EXTRAPOLATES from the confirmed
+    // horizon to the present, symmetric with how a client extrapolates the host body,
+    // rather than consuming the client's ahead-of-confirmed input it holds future-queued.
+    // The host's own (authority) body runs from live input (empty queue), so it loads at
+    // the present unchanged.
+    let remote_tick = RepliconTick::new(sim_tick.get().min(confirmed.0));
     for (mut input, mut input_queue, authority) in query.iter_mut() {
-        let found = input_queue.next(*tick);
+        let at = if authority { sim_tick } else { remote_tick };
+        let found = input_queue.next(at);
         if found.is_none() && authority {
             continue;
         }
@@ -374,6 +387,7 @@ mod tests {
     fn loads_inputs_with_queue() {
         let mut app = App::new();
         app.add_systems(Update, load_inputs::<A, Tick>)
+            .init_resource::<ConfirmedHorizon>()
             .insert_resource(Tick(5));
 
         let mut queue = InputQueue::<A>::default();
@@ -414,10 +428,41 @@ mod tests {
         assert_eq!(A(2), *e.get::<A>().unwrap());
     }
 
+    /// A remote (non-authority) body whose queue holds input both at the confirmed
+    /// horizon and ahead of it (the present) must load the CONFIRMED-tick input — so
+    /// it extrapolates the present from the confirmed horizon — while an authority
+    /// body ignores the horizon and loads at the present. This is what makes the
+    /// host's render of a remote body extrapolate symmetrically with the client's.
+    #[test]
+    fn remote_body_loads_at_confirmed_horizon_authority_loads_at_present() {
+        let mut app = App::new();
+        app.add_systems(Update, load_inputs::<A, Tick>)
+            .insert_resource(ConfirmedHorizon(5))
+            .insert_resource(Tick(7));
+
+        // Remote body: queue holds ticks 5 (A(10), confirmed), 6, 7 (A(30), present).
+        let mut queue = InputQueue::<A>::default();
+        queue.add(Tick(7), &hist(5, [A(10), A(20), A(30)]));
+        let remote = app.world_mut().spawn((A(0), queue)).id();
+
+        // Authority body: same queue, but it loads at the present regardless.
+        let mut queue = InputQueue::<A>::default();
+        queue.add(Tick(7), &hist(5, [A(10), A(20), A(30)]));
+        let own = app.world_mut().spawn((A(0), queue, InputAuthority)).id();
+
+        app.update();
+
+        // Remote clamps to `min(present 7, confirmed 5) = 5` → tick 5's input.
+        assert_eq!(A(10), *app.world().entity(remote).get::<A>().unwrap());
+        // Authority loads the present tick 7's input.
+        assert_eq!(A(30), *app.world().entity(own).get::<A>().unwrap());
+    }
+
     #[test]
     fn clears_inputs_empty_queue() {
         let mut app = App::new();
         app.add_systems(Update, load_inputs::<A, Tick>)
+            .init_resource::<ConfirmedHorizon>()
             .insert_resource(Tick(5));
 
         let e1 = app
@@ -479,6 +524,7 @@ mod tests {
         let mut app = App::new();
 
         app.add_systems(Update, load_inputs::<A, Tick>)
+            .init_resource::<ConfirmedHorizon>()
             .insert_resource(Tick(7));
 
         let mut queue = InputQueue::<A>::default();

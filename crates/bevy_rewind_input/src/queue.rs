@@ -81,7 +81,29 @@ impl<T: InputTrait> InputQueue<T> {
                 .or_else(|| self.queue.iter().find(|(qt, _)| *qt == t).map(|(_, v)| v));
             let is_novel = match existing {
                 Some(v) => v != new_val,
-                None => highest_consumed.is_none_or(|hc| t.get() > hc),
+                None => match highest_consumed {
+                    // Nothing consumed yet: no prediction baseline, so any past
+                    // input is potentially new information.
+                    None => true,
+                    // An unseen tick the simulator has already run past is a real
+                    // misprediction only if its value differs from what we
+                    // PREDICTED there — the last consumed input repeated forward
+                    // (input-repeat is how the body is extrapolated). A new tick
+                    // whose value matches that repeat is steady-state delivery,
+                    // not a correction, so it must not trigger a rollback. (A tick
+                    // <= highest_consumed is either still in `past` — handled by
+                    // the `Some` arm above — or older than anything we've run.)
+                    Some(hc) => {
+                        t.get() > hc && {
+                            let predicted = self
+                                .past
+                                .back()
+                                .and_then(|(bt, bv)| bv.repeated(t.get() - bt.get()))
+                                .unwrap_or_default();
+                            predicted != *new_val
+                        }
+                    }
+                },
             };
             if is_novel {
                 earliest_novel = Some(t);
@@ -325,6 +347,46 @@ mod tests {
         assert_eq!(
             Some(RepliconTick::new(7)),
             queue.add(Tick(10), &hist(7, [A(42)])),
+        );
+    }
+
+    /// A new past tick whose value EQUALS what input-repeat already predicted for
+    /// it is NOT a misprediction — the body was extrapolated with exactly that
+    /// input, so resimulating would reproduce the same state. Reporting it novel
+    /// is what made the host roll back every tick of a steady walk (each tick
+    /// delivers a new-but-unchanged input). Divergence must be measured against
+    /// the repeated prediction, not "is this a new tick".
+    #[test]
+    fn queue_does_not_report_predicted_repeat_as_novel() {
+        let mut queue = InputQueue::<A>::default();
+        // Walk: ticks 5,6,7 = A(1); consume through 7 so `past.back()` = (7, A(1)).
+        queue.add(Tick(5), &hist(5, [A(1), A(1), A(1)]));
+        for t in 5..=7 {
+            queue.next(Tick(t));
+        }
+        // A new past tick 8 arrives carrying the SAME A(1) the repeat already
+        // predicted for tick 8. No misprediction ⇒ no rollback.
+        assert_eq!(
+            None,
+            queue.add(Tick(10), &hist(8, [A(1)])),
+            "a new past tick equal to the repeated prediction is not a misprediction",
+        );
+    }
+
+    /// The contrast: a new past tick whose value DIFFERS from the repeated
+    /// prediction (e.g. the client's "stop" landing while the host extrapolated
+    /// the walk) is a real misprediction and must request a rollback to it.
+    #[test]
+    fn queue_reports_diverging_new_past_tick_as_novel() {
+        let mut queue = InputQueue::<A>::default();
+        queue.add(Tick(5), &hist(5, [A(1), A(1), A(1)]));
+        for t in 5..=7 {
+            queue.next(Tick(t));
+        }
+        assert_eq!(
+            Some(RepliconTick::new(8)),
+            queue.add(Tick(10), &hist(8, [A(9)])),
+            "a new past tick differing from the repeated prediction is a misprediction",
         );
     }
 

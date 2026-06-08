@@ -120,6 +120,29 @@ pub trait InputTrait:
 #[derive(Component, Default)]
 pub struct InputAuthority;
 
+/// The latest *confirmed* tick — the horizon beyond which a non-authority (remote)
+/// body's input is EXTRAPOLATED rather than taken from the queue, on the server.
+/// `load_inputs` loads a remote body's input at `min(sim_tick, confirmed)` instead of
+/// `sim_tick`: at or before the confirmed tick it uses the real queued input (so the
+/// authoritative reconstruction during resim stays correct), and beyond it (the lead
+/// window, `confirmed < sim_tick ≤ present`) it repeats the confirmed input — so the
+/// remote body extrapolates from the confirmed horizon to the present, symmetric with
+/// how a client extrapolates the host body it only has input for up to `present −
+/// one_way`. Reconciled by rollback when newer input lands.
+///
+/// Default [`u32::MAX`] → `min(sim_tick, confirmed) == sim_tick`, i.e. no
+/// extrapolation (the prior behaviour, and correct at zero latency where present ==
+/// confirmed). The host sets it to its `ServerTick`. Authority bodies ignore it (their
+/// queue is empty; they run from live input).
+#[derive(Resource, Debug, Clone, Copy)]
+pub struct ConfirmedHorizon(pub u32);
+
+impl Default for ConfirmedHorizon {
+    fn default() -> Self {
+        Self(u32::MAX)
+    }
+}
+
 #[derive(Message, Clone, TypePath, Serialize, Deserialize, PartialEq, Eq, Debug)]
 #[serde(bound(deserialize = "T: for<'de2> serde::Deserialize<'de2>"))]
 struct HistoryFor<T: InputTrait> {

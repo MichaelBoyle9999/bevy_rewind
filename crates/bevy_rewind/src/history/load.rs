@@ -5,7 +5,7 @@ use super::{
     component_history::TickData,
     predicted::PredictedHistory,
 };
-use crate::{LoadFrom, Predicted, RemoteReplicated, RollbackLoadSet, RollbackSchedule, TickSource};
+use crate::{LoadFrom, Predicted, RollbackLoadSet, RollbackSchedule};
 
 use bevy::{
     ecs::{
@@ -201,110 +201,9 @@ fn load_confirmed_authoritative(
     }
 }
 
-/// Eagerly copy the latest confirmed authoritative state onto every
-/// [`Predicted`] entity that also carries [`RemoteReplicated`], using
-/// `previous_tick = current_tick - 1` as the load point.
-///
-/// This is the *steady-state* delivery path for remote-replicated entities:
-/// without it, the only path that lifts an [`AuthoritativeHistory`] entry
-/// onto an entity's component is [`load_confirmed_authoritative`] running
-/// inside the rollback resim loop, which makes chronic rollback structurally
-/// load-bearing. With this system wired in user-side `FixedPreUpdate` (after
-/// the tick has been advanced for the frame), remote bodies stay current
-/// without any rollback firing, and the rollback runtime can be gated on
-/// genuine prediction divergence.
-///
-/// The body mirrors [`load_confirmed_authoritative`]; the only differences
-/// are the entity filter ([`With<RemoteReplicated>`]) and that the
-/// previous-tick load point is derived from [`Res<Tick>`] rather than
-/// [`Res<LoadFrom>`] (so it can run outside the rollback context, where
-/// [`LoadFrom`] is not present).
-pub fn lift_remote_replicated<Tick: TickSource>(
-    mut commands: Commands,
-    mut q: Query<
-        (
-            EntityMutExcept<(AuthoritativeHistory, ConfirmHistory)>,
-            &AuthoritativeHistory,
-            &ConfirmHistory,
-        ),
-        (
-            With<Predicted>,
-            With<RemoteReplicated>,
-            Or<(With<Disabled>, Without<Disabled>)>,
-        ),
-    >,
-    registry: Res<RollbackRegistry>,
-    tick: Res<Tick>,
-    global_confirm: Res<ServerMutateTicks>,
-    entities: &Entities,
-    e_alloc: &EntityAllocator,
-) {
-    let current: RepliconTick = (*tick).into();
-    // Before the FixedUpdate that simulates `current`, the entity should hold
-    // the end-of-(current-1) state, matching the rollback runtime's resim
-    // load point (`LoadFrom = start - 1`).
-    let previous_tick = RepliconTick::new(current.get().saturating_sub(1));
-
-    let mut inserts = InsertBatch::new();
-    let mut load_queue = CommandQueue::default();
-    let mut removes = RemoveBatch::new();
-
-    for (entity, authoritative, confirmed) in q.iter_mut() {
-        let mut load_commands = Commands::new_from_entities(&mut load_queue, e_alloc, entities);
-        for (&comp_id, auth_hist) in authoritative.iter() {
-            let &reg_idx = registry.ids.get(&comp_id).unwrap();
-            let component = registry.components.get(reg_idx).unwrap();
-
-            let check_range = auth_hist.empty_after(previous_tick.get());
-            let end_tick = RepliconTick::new(previous_tick.get() + check_range);
-            if !confirmed.contains_any(previous_tick, end_tick)
-                && !global_confirm.contains_any(previous_tick, end_tick)
-            {
-                continue;
-            }
-
-            match auth_hist.get_latest(previous_tick.get()) {
-                TickData::Value(value) => {
-                    inserts.push(comp_id, component, |dst| unsafe {
-                        component.load_to_uninit(
-                            Some(value),
-                            entity.get_by_id(comp_id),
-                            dst,
-                            load_commands.reborrow(),
-                            entity.id(),
-                        );
-                    });
-                    continue;
-                }
-                TickData::Removed => {
-                    removes.push(comp_id);
-                    continue;
-                }
-                TickData::Missing => {}
-            }
-        }
-
-        if !inserts.is_empty() {
-            commands.entity(entity.id()).queue(inserts.clone());
-            inserts.clear();
-        }
-
-        if !removes.is_empty() {
-            commands.entity(entity.id()).queue(removes.clone());
-            removes.clear();
-        }
-
-        if !load_queue.is_empty() {
-            let mut queue = std::mem::take(&mut load_queue);
-            commands.queue(move |world: &mut World| queue.apply(world));
-        }
-    }
-}
-
 /// Query of the histories needed to decide whether a self-predicted entity
-/// mispredicted. Excludes [`RemoteReplicated`] entities: those are delivered by
-/// [`lift_remote_replicated`], not by rollback, so their (lift-synced) state is
-/// not what should drive the rollback trigger.
+/// mispredicted. Every [`Predicted`] body — whether driven by local input or by a
+/// remote peer's replayed input — flows through this one rollback path.
 pub(crate) type DivergenceQuery<'w, 's> = Query<
     'w,
     's,
@@ -313,7 +212,7 @@ pub(crate) type DivergenceQuery<'w, 's> = Query<
         &'static AuthoritativeHistory,
         &'static ConfirmHistory,
     ),
-    (With<Predicted>, Without<RemoteReplicated>),
+    With<Predicted>,
 >;
 
 /// Returns `true` if replaying the resim window `[start, real_tick]` would
@@ -865,168 +764,6 @@ mod tests {
     }
 
     ///////////////////////////////////////////////////
-    /////      lift_remote_replicated tests       //////
-    ///////////////////////////////////////////////////
-
-    use crate::RemoteReplicated;
-    use crate::history::load::lift_remote_replicated;
-
-    /// A test [`TickSource`] that the lift system reads.
-    #[derive(Resource, Clone, Copy, Default)]
-    struct Tick(u32);
-
-    impl From<RepliconTick> for Tick {
-        fn from(value: RepliconTick) -> Self {
-            Self(value.get())
-        }
-    }
-
-    impl From<Tick> for RepliconTick {
-        fn from(value: Tick) -> Self {
-            RepliconTick::new(value.0)
-        }
-    }
-
-    fn init_lift_app<C: Component + Clone + PartialEq>(tick: u32) -> (App, ComponentId) {
-        let mut app = App::new();
-        app.add_systems(Update, lift_remote_replicated::<Tick>)
-            .init_resource::<ServerMutateTicks>()
-            .insert_resource(Tick(tick));
-
-        let mut registry = RollbackRegistry::default();
-        registry.register::<C>(app.world_mut());
-        app.insert_resource(registry);
-
-        let comp_id = app.world_mut().register_component::<C>();
-
-        (app, comp_id)
-    }
-
-    /// Steady-state delivery: a `Predicted + RemoteReplicated` entity with a
-    /// confirmed authoritative value at the prior tick gets that value lifted
-    /// onto the component, with no rollback involved.
-    #[test]
-    fn lift_writes_latest_confirmed_to_entity() {
-        let (mut app, comp_a) = init_lift_app::<A>(2);
-
-        let auth_hist = auth_history(1, comp_a, [a(5)]);
-        let confirm = confirm_history([1]);
-        let e1 = app
-            .world_mut()
-            .spawn((Predicted, RemoteReplicated, auth_hist, confirm, A(1)))
-            .id();
-
-        app.update();
-
-        let e = app.world().entity(e1);
-        assert_eq!(Some(&A(5)), e.get::<A>());
-    }
-
-    /// Without [`RemoteReplicated`], the lift system must leave the entity
-    /// alone — that is the contract that lets self-predicted entities keep
-    /// their predicted component value between confirms.
-    #[test]
-    fn lift_skips_entities_without_remote_replicated_marker() {
-        let (mut app, comp_a) = init_lift_app::<A>(2);
-
-        let auth_hist = auth_history(1, comp_a, [a(5)]);
-        let confirm = confirm_history([1]);
-        let e1 = app
-            .world_mut()
-            .spawn((Predicted, auth_hist, confirm, A(1)))
-            .id();
-
-        app.update();
-
-        let e = app.world().entity(e1);
-        assert_eq!(Some(&A(1)), e.get::<A>());
-    }
-
-    /// The lift must not run for entities lacking [`Predicted`] — they are
-    /// not part of the rollback machinery and have no histories to read.
-    #[test]
-    fn lift_skips_entities_without_predicted_marker() {
-        let (mut app, comp_a) = init_lift_app::<A>(2);
-
-        let auth_hist = auth_history(1, comp_a, [a(5)]);
-        let confirm = confirm_history([1]);
-        let e1 = app
-            .world_mut()
-            .spawn((RemoteReplicated, auth_hist, confirm, A(1)))
-            .id();
-
-        app.update();
-
-        let e = app.world().entity(e1);
-        assert_eq!(Some(&A(1)), e.get::<A>());
-    }
-
-    /// If no tick covering the auth history is confirmed (locally or
-    /// globally), the lift system must not write — exactly the same gate as
-    /// [`load_confirmed_authoritative`], so an unconfirmed value never leaks
-    /// onto the entity ahead of its confirm.
-    #[test]
-    fn lift_skips_unconfirmed_history() {
-        let (mut app, comp_a) = init_lift_app::<A>(2);
-
-        let auth_hist = auth_history(1, comp_a, [a(5)]);
-        let confirm = confirm_history([]);
-        let e1 = app
-            .world_mut()
-            .spawn((Predicted, RemoteReplicated, auth_hist, confirm, A(1)))
-            .id();
-
-        app.update();
-
-        let e = app.world().entity(e1);
-        assert_eq!(Some(&A(1)), e.get::<A>());
-    }
-
-    /// Global (`ServerMutateTicks`) confirmation is honoured in the same way
-    /// as per-entity `ConfirmHistory` confirmation — mirrors
-    /// `load_globally_confirmed_confirmed_gap`.
-    #[test]
-    fn lift_honours_global_confirmation() {
-        let (mut app, comp_a) = init_lift_app::<A>(2);
-
-        let auth_hist = auth_history(1, comp_a, [a(5)]);
-        let confirm = confirm_history([]);
-        let e1 = app
-            .world_mut()
-            .spawn((Predicted, RemoteReplicated, auth_hist, confirm, A(1)))
-            .id();
-
-        app.world_mut()
-            .resource_mut::<ServerMutateTicks>()
-            .confirm(r_tick(1), 1);
-
-        app.update();
-
-        let e = app.world().entity(e1);
-        assert_eq!(Some(&A(5)), e.get::<A>());
-    }
-
-    /// A `TickData::Removed` entry in the authoritative history at the prior
-    /// tick must cause the component to be removed from the entity, so a
-    /// server-side despawn-of-component propagates without needing rollback.
-    #[test]
-    fn lift_removes_when_authoritative_history_is_removed() {
-        let (mut app, comp_a) = init_lift_app::<A>(2);
-
-        let auth_hist = auth_history::<A>(1, comp_a, [TickData::Removed]);
-        let confirm = confirm_history([1]);
-        let e1 = app
-            .world_mut()
-            .spawn((Predicted, RemoteReplicated, auth_hist, confirm, A(1)))
-            .id();
-
-        app.update();
-
-        let e = app.world().entity(e1);
-        assert_eq!(None, e.get::<A>());
-    }
-
-    ///////////////////////////////////////////////////
     /////      divergence-gate (rollback) tests    //////
     ///////////////////////////////////////////////////
 
@@ -1196,9 +933,8 @@ mod tests {
         (app, comp_id)
     }
 
-    /// A self-predicted entity (no `RemoteReplicated`) whose confirmed
-    /// authoritative value differs from its prediction makes the query report a
-    /// state-changing rollback.
+    /// A `Predicted` entity whose confirmed authoritative value differs from its
+    /// prediction makes the query report a state-changing rollback.
     #[test]
     fn rollback_would_change_state_detects_self_predicted_divergence() {
         let (mut app, comp_a) = init_diverge_app::<A>(1, 1);
@@ -1212,24 +948,6 @@ mod tests {
         app.update();
 
         assert!(app.world().resource::<DivergeOut>().0);
-    }
-
-    /// `RemoteReplicated` entities are excluded from the divergence query: their
-    /// state is delivered by `lift_remote_replicated`, not by rollback, so even a
-    /// mismatch must not drive the rollback trigger.
-    #[test]
-    fn rollback_would_change_state_excludes_remote_replicated() {
-        let (mut app, comp_a) = init_diverge_app::<A>(1, 1);
-
-        let pred = pred_history(0, comp_a, [a(5)]);
-        let auth = auth_history(0, comp_a, [a(9)]);
-        let confirm = confirm_history([0]);
-        app.world_mut()
-            .spawn((Predicted, RemoteReplicated, pred, auth, confirm, A(5)));
-
-        app.update();
-
-        assert!(!app.world().resource::<DivergeOut>().0);
     }
 
     /// With no self-predicted entities at all, no rollback would change state.

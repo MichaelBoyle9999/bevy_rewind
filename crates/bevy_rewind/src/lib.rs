@@ -1,7 +1,7 @@
 //! A crate for generic rollback handling in bevy
 
 mod history;
-pub use history::{AuthoritativeHistory, ExistingOrUninit, lift_remote_replicated};
+pub use history::{AuthoritativeHistory, ExistingOrUninit, install_confirmed_replication_source};
 use history::{LoadFn, RollbackRegistry};
 
 mod predicted_resource;
@@ -158,6 +158,21 @@ fn calculate_rollback_target<Tick: TickSource>(
 ) {
     let tick = (*tick).into();
 
+    // Whether an eager path (input-divergence detection in `receive_inputs`) already
+    // requested a rollback this tick, captured before the confirm-message
+    // composition below overwrites it. An eager target is a *proven* misprediction —
+    // the just-arrived input differs from what was predicted (repeated) for that
+    // tick — so it must NOT be vetoed by the state-divergence gate further down,
+    // whose confirmed-state comparison lags the input by the state-replication
+    // delay. Without this, a client that has the remote peer's new input in hand
+    // still coasts on the stale prediction until the *state* confirm catches up,
+    // overshooting a remote body's direction change; with it, the client reconciles
+    // on input arrival, as promptly as the server's own (ungated) eager path does.
+    // No-op on the server: its gate is already inert (`diverged.is_empty()`, no
+    // inbound `AuthoritativeHistory` for bodies it owns), so the added term changes
+    // nothing there — only the client, whose gate is live, is freed.
+    let eager_in = **rollback_target;
+
     for message_tick in individual_confirms
         .read()
         .map(|c| c.tick)
@@ -192,9 +207,9 @@ fn calculate_rollback_target<Tick: TickSource>(
     // every tick even though the prediction was perfect. Gating on real divergence
     // makes that chronic rollback disappear, while still firing exactly one
     // corrective rollback when the prediction is genuinely wrong — e.g. the
-    // spawn-collapse position handoff onto a client's own body, which has
-    // `Predicted` but not `RemoteReplicated` and so is delivered by rollback rather
-    // than `lift_remote_replicated`. See `game/tests/client_movement_visibility.rs`.
+    // spawn-collapse position handoff onto a client's own body. Every `Predicted`
+    // body (local-input or remote-replayed) is delivered by this one rollback path.
+    // See `game/tests/client_movement_visibility.rs`.
     //
     // Future targets (target > tick) are NOT gated: they fast-forward in
     // `trigger_rollback` to load just-arrived authoritative state stamped ahead of
@@ -216,6 +231,7 @@ fn calculate_rollback_target<Tick: TickSource>(
     // always has at least the local player's body, so the gate is always live
     // there.
     if target.get() < tick.get()
+        && eager_in.is_none()
         && !diverged.is_empty()
         && !history::rollback_would_change_state(
             &diverged,
@@ -703,32 +719,6 @@ fn remove_histories(mut world: DeferredWorld, ctx: HookContext) {
         .entity(ctx.entity)
         .try_remove::<(history::PredictedHistory, AuthoritativeHistory)>();
 }
-
-/// Companion marker for [`Predicted`] entities whose simulation state is
-/// authored by a remote authority (e.g. the host's body on a pure client, or
-/// any peer's body on every observer).
-///
-/// `Predicted` alone means "this entity participates in rollback and its
-/// authoritative history is snapshotted as it arrives, but the entity's
-/// component values are updated only via the rollback resim path". That is
-/// the right contract for a *self-predicted* entity — one driven by the local
-/// player's inputs — because we want the entity to display the *predicted*
-/// value between confirms, with rollback reconciling any divergence.
-///
-/// `Predicted + RemoteReplicated` adds the contract "and copy the latest
-/// confirmed authoritative value onto the entity each fixed tick". For a
-/// purely remote body this is what you want: the entity tracks the latest
-/// auth state without any local input-driven prediction. The rollback runtime
-/// still re-applies historical auth during a real resim (so coupled physics
-/// stays consistent), but steady-state delivery does not depend on rollback
-/// firing — which is what lets the receiver suppress chronic depth-1
-/// rollback at zero latency without freezing remote bodies.
-///
-/// Add a system running [`lift_remote_replicated`] in the user's
-/// `FixedPreUpdate` (after the tick has been advanced for the frame) to wire
-/// up the steady-state delivery.
-#[derive(Component, Default)]
-pub struct RemoteReplicated;
 
 /// Data for a tick
 #[derive(Copy, Clone, PartialEq, Debug)]

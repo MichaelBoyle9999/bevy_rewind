@@ -3,8 +3,10 @@
 use crate::{HistoryFor, InputAuthority, InputHistory, InputQueueSet, InputTrait, TickSource};
 
 use bevy::{ecs::schedule::InternedScheduleLabel, prelude::*};
-use bevy_replicon::{client::ClientSystems, prelude::ClientState};
-use bevy_rewind::Resimulating;
+use bevy_replicon::{
+    client::ClientSystems, prelude::ClientState, shared::replicon_tick::RepliconTick,
+};
+use bevy_rewind::{Resimulating, RollbackTarget};
 
 pub(super) struct InputQueueClientPlugin<T: InputTrait, Tick: TickSource> {
     schedule: InternedScheduleLabel,
@@ -25,7 +27,7 @@ impl<T: InputTrait, Tick: TickSource> Plugin for InputQueueClientPlugin<T, Tick>
     fn build(&self, app: &mut App) {
         app.add_systems(
             PreUpdate,
-            receive_inputs::<T>
+            receive_inputs::<T, Tick>
                 .run_if(in_state(ClientState::Connected))
                 .after(ClientSystems::Receive)
                 .in_set(InputQueueSet::Network),
@@ -110,10 +112,13 @@ fn send_input_messages<T: InputTrait>(
     }
 }
 
-fn receive_inputs<T: InputTrait>(
+fn receive_inputs<T: InputTrait, Tick: TickSource>(
     mut messages: MessageReader<HistoryFor<T>>,
     mut query: Query<&mut InputHistory<T>>,
+    cur_tick: Res<Tick>,
+    mut rollback_target: ResMut<RollbackTarget>,
 ) {
+    let cur_tick: RepliconTick = (*cur_tick).into();
     for HistoryFor {
         entity,
         tick,
@@ -128,6 +133,26 @@ fn receive_inputs<T: InputTrait>(
             );
             continue;
         };
+
+        // Resim a remote body only on a genuine *misprediction* — the client-side
+        // mirror of the server's `InputQueue::add` divergence check. We extrapolate
+        // a remote body by repeating its last known input; a broadcast that fills a
+        // past tick we already ran with exactly that repeated value is steady-state
+        // delivery, not a correction, and must not roll back (otherwise a remote
+        // body whose present runs ahead of the confirmed stream would roll back
+        // every tick). So snapshot the *predicted* value (`get(.., true)` — the
+        // repeat) at every past tick this message can touch, apply the message,
+        // then find the earliest tick whose predicted value actually changed; that
+        // is where a resim must replay from. The window spans
+        // `[tick - max_past_offset, cur_tick)`: `past` reaches back from the stamp,
+        // and a `future` entry is only in our past once our present has run beyond
+        // it.
+        let max_past_offset = past.iter().map(|(rt, _)| *rt as u32).max().unwrap_or(0);
+        let before: Vec<(u32, Option<T>)> = (tick.get().saturating_sub(max_past_offset)
+            ..cur_tick.get())
+            .map(|t| (t, history.get(RepliconTick::new(t), true)))
+            .collect();
+
         let mut past_iter = past.iter().peekable();
         while let (Some((rt, t)), until) = (
             past_iter.next(),
@@ -140,6 +165,17 @@ fn receive_inputs<T: InputTrait>(
             }));
         }
         history.replace_section(future.iter().map(|(rt, t)| (*tick + *rt as u32, t.clone())));
+
+        if let Some((t, _)) = before
+            .into_iter()
+            .find(|(t, b)| history.get(RepliconTick::new(*t), true) != *b)
+        {
+            let target = RepliconTick::new(t);
+            **rollback_target = Some(match **rollback_target {
+                Some(prev) => prev.min(target),
+                None => target,
+            });
+        }
     }
 }
 
@@ -230,7 +266,9 @@ mod tests {
     fn receive_input_writes_history() {
         let mut app = App::new();
         app.add_message::<HistoryFor<A>>()
-            .add_systems(Update, receive_inputs::<A>);
+            .init_resource::<RollbackTarget>()
+            .insert_resource(Tick(8))
+            .add_systems(Update, receive_inputs::<A, Tick>);
         let e1 = app.world_mut().spawn(InputHistory::<A>::default()).id();
         let e2 = app.world_mut().spawn(InputHistory::<A>::default()).id();
 
@@ -252,5 +290,116 @@ mod tests {
         let actual = app.world().entity(e2).get::<InputHistory<A>>();
         let expected = hist(0, []);
         assert_eq!(Some(&expected), actual);
+    }
+
+    /// Build a single-system app exercising the client `receive_inputs`
+    /// misprediction trigger: a `Tick` source, a `RollbackTarget`, and a body
+    /// whose `InputHistory` is the target of the broadcast.
+    fn diverge_app(cur_tick: u32) -> App {
+        let mut app = App::new();
+        app.add_message::<HistoryFor<A>>()
+            .init_resource::<RollbackTarget>()
+            .insert_resource(Tick(cur_tick))
+            .add_systems(Update, receive_inputs::<A, Tick>);
+        app
+    }
+
+    /// A broadcast input asserting a value at an already-extrapolated past tick
+    /// that EQUALS what input-repeat predicted there must NOT request a rollback —
+    /// the body did not mispredict. This is the novelty guard that keeps a remote
+    /// body whose present runs ahead from rolling back every tick of a steady walk.
+    #[test]
+    fn receive_input_no_rollback_when_input_matches_prediction() {
+        let mut app = diverge_app(8);
+        // Mirror extrapolated ticks 2..=5 = A(1) (the repeated walk input).
+        let e = app
+            .world_mut()
+            .spawn(hist(2, [A(1), A(1), A(1), A(1)]))
+            .id();
+
+        // Stamp 6 fills past tick 6 with A(1) — exactly the repeat. No correction.
+        app.world_mut().write_message(HistoryFor {
+            entity: e,
+            tick: Tick(6).into(),
+            past: default(),
+            future: [(0u8, A(1))].into_iter().collect(),
+        });
+
+        app.update();
+
+        assert_eq!(
+            None,
+            **app.world().resource::<RollbackTarget>(),
+            "an input equal to the repeated prediction is not a misprediction",
+        );
+    }
+
+    /// The contrast: a broadcast input that DIFFERS from the repeated prediction
+    /// at a past tick (the host's "stop" landing while we extrapolated the walk)
+    /// is a real misprediction and must request a rollback to that tick.
+    #[test]
+    fn receive_input_requests_rollback_on_diverging_input() {
+        let mut app = diverge_app(8);
+        let e = app
+            .world_mut()
+            .spawn(hist(2, [A(1), A(1), A(1), A(1)]))
+            .id();
+
+        // Stamp 6 fills past tick 6 with A(0) (stop) — diverges from the predicted A(1).
+        app.world_mut().write_message(HistoryFor {
+            entity: e,
+            tick: Tick(6).into(),
+            past: default(),
+            future: [(0u8, A(0))].into_iter().collect(),
+        });
+
+        app.update();
+
+        assert_eq!(
+            Some(RepliconTick::new(6)),
+            **app.world().resource::<RollbackTarget>(),
+            "a diverging input must request a rollback to the mispredicted tick",
+        );
+    }
+
+    /// The misprediction target composes with an existing `RollbackTarget` via
+    /// `min`: a pre-existing earlier target is preserved, a later one is lowered.
+    #[test]
+    fn receive_input_rollback_target_takes_min_with_existing() {
+        let mut app = diverge_app(8);
+        let e = app
+            .world_mut()
+            .spawn(hist(2, [A(1), A(1), A(1), A(1)]))
+            .id();
+
+        // Earlier pre-existing target wins over a later misprediction.
+        **app.world_mut().resource_mut::<RollbackTarget>() = Some(RepliconTick::new(3));
+        app.world_mut().write_message(HistoryFor {
+            entity: e,
+            tick: Tick(6).into(),
+            past: default(),
+            future: [(0u8, A(0))].into_iter().collect(),
+        });
+        app.update();
+        assert_eq!(
+            Some(RepliconTick::new(3)),
+            **app.world().resource::<RollbackTarget>(),
+            "an earlier pre-existing target must not be raised",
+        );
+
+        // A later pre-existing target is lowered to the mispredicted tick.
+        **app.world_mut().resource_mut::<RollbackTarget>() = Some(RepliconTick::new(10));
+        app.world_mut().write_message(HistoryFor {
+            entity: e,
+            tick: Tick(6).into(),
+            past: default(),
+            future: [(0u8, A(2))].into_iter().collect(),
+        });
+        app.update();
+        assert_eq!(
+            Some(RepliconTick::new(6)),
+            **app.world().resource::<RollbackTarget>(),
+            "a later pre-existing target must be lowered to the mispredicted tick",
+        );
     }
 }
