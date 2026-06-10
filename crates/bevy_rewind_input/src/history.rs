@@ -81,7 +81,15 @@ impl<T: InputTrait> InputHistory<T> {
         self.list.get(index as usize).cloned()
     }
 
-    /// Write an input to the history
+    /// Write an input to the history. A write whose tick is more than one ahead
+    /// of `updated_at` (a lost message, or a sender whose present skipped a tick
+    /// on a lead slew) fills the gap by *repeating* the last known input — the
+    /// same extrapolation [`Self::get`] applies beyond `updated_at` — so a gap
+    /// tick replays as "kept doing what they were doing". Falling to
+    /// `T::default()` instead planted a spurious zero input (a walking body
+    /// halted and snapped its facing to default for one tick); non-repeating
+    /// inputs still fill with the default, matching their `repeated() == None`
+    /// contract.
     pub fn write(&mut self, tick: impl Into<RepliconTick>, value: T) {
         let tick = tick.into();
         if tick <= self.updated_at {
@@ -96,11 +104,14 @@ impl<T: InputTrait> InputHistory<T> {
                 while tick - self.first_tick() > self.list.capacity() as u32 {
                     self.list.pop_front();
                 }
-                self.list.extend(
-                    (self.updated_at.get()..tick.get())
-                        .skip(1)
-                        .map(|_| T::default()),
-                );
+                let last = self.list.back().cloned();
+                let updated_at = self.updated_at.get();
+                self.list
+                    .extend((updated_at..tick.get()).skip(1).map(|gap_tick| {
+                        last.as_ref()
+                            .and_then(|input| input.repeated(gap_tick - updated_at))
+                            .unwrap_or_default()
+                    }));
             }
         }
 
@@ -120,8 +131,12 @@ impl<T: InputTrait> InputHistory<T> {
             } else if tick > self.updated_at {
                 self.write(tick, t.clone());
             } else if tick < self.first_tick() {
+                // Front-fill the gap between this past value and the existing
+                // window by repeating it forward — the same extrapolation `write`
+                // applies to a trailing gap — rather than planting defaults.
                 while tick + 1 < self.first_tick() {
-                    self.list.push_front(T::default());
+                    let gap = self.first_tick() - tick - 1;
+                    self.list.push_front(t.repeated(gap).unwrap_or_default());
                 }
                 self.list.push_front(t.clone());
             } else if self.list.is_empty() {
@@ -210,12 +225,14 @@ pub(super) mod tests {
         assert_eq!(2, history.list.len());
         assert_eq!(RepliconTick::new(16), history.updated_at());
 
-        // When there's a gap, the history is patched up
+        // When there's a gap, the history is patched up by repeating the last
+        // known input across the missing ticks (the body "kept doing what it
+        // was doing"), not by planting defaults.
         history.write(Tick(20), A(6));
         assert_eq!(6, history.list.len());
         assert_eq!(RepliconTick::new(20), history.updated_at());
 
-        assert_eq!(hist(15, [A(1), A(2), A(0), A(0), A(0), A(6)]), history);
+        assert_eq!(hist(15, [A(1), A(2), A(2), A(2), A(2), A(6)]), history);
 
         // When the gap exceeds capacity, the old history is cleared. Gap must
         // exceed `INPUT_HISTORY_CAPACITY` (20), so write at tick 41 (gap 21).
@@ -230,10 +247,11 @@ pub(super) mod tests {
 
         history.write(Tick(25), A(15));
         assert_eq!(10, history.list.len());
+        // The five-tick gap (20..=24) repeats the last known input A(9).
         assert_eq!(
             hist(
                 16,
-                (6..10).map(A).chain((0..5).map(|_| A(0))).chain([A(15)])
+                (6..10).map(A).chain((0..5).map(|_| A(9))).chain([A(15)])
             ),
             history
         );

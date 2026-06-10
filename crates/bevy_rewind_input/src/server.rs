@@ -10,7 +10,7 @@ use crate::{
 use arrayvec::ArrayVec;
 use bevy::{ecs::schedule::InternedScheduleLabel, prelude::*};
 use bevy_replicon::{prelude::*, shared::replicon_tick::RepliconTick};
-use bevy_rewind::RollbackTarget;
+use bevy_rewind::{Resimulating, RollbackTarget};
 
 pub(super) struct InputQueueServerPlugin<T: InputTrait, Tick: TickSource> {
     schedule: InternedScheduleLabel,
@@ -38,11 +38,14 @@ impl<T: InputTrait, Tick: TickSource> Plugin for InputQueueServerPlugin<T, Tick>
         )
         .add_systems(
             self.schedule,
-            load_inputs::<T, Tick>
-                .run_if(in_state(ServerState::Running))
-                .in_set(InputQueueSet::Load)
-                // In case the configured schedule is PreUpdate
-                .after(InputQueueSet::Network),
+            (
+                store_authority_inputs::<T, Tick>.before(InputQueueSet::Load),
+                load_inputs::<T, Tick>
+                    .in_set(InputQueueSet::Load)
+                    // In case the configured schedule is PreUpdate
+                    .after(InputQueueSet::Network),
+            )
+                .run_if(in_state(ServerState::Running)),
         )
         .add_systems(
             PostUpdate,
@@ -109,13 +112,53 @@ fn receive_inputs<T: InputTrait, Tick: TickSource>(
     }
 }
 
+/// Record an `InputAuthority` body's live input into its own history and queue,
+/// once per real simulation step, before [`load_inputs`] reads the queue. This is
+/// the listen-server host's *loopback delivery*: it feeds the exact same
+/// [`InputQueue::add`] entry point a remote client's `FromClient` message feeds in
+/// [`receive_inputs`], so from here on the host body is indistinguishable from a
+/// client body — [`load_inputs`] consumes its tick from the queue (an identity
+/// write during forward simulation; the *historical* input during a rollback
+/// resim, fixing the host body resimulating with its live present input), and
+/// [`send_inputs`] broadcasts it with the same past-redundancy every client body
+/// gets (replacing a former special case that sent the live input as a single
+/// unprotected future entry).
+///
+/// Gated off during a rollback resim — the recorded history *is* what the resim
+/// replays; rewriting it mid-resim with whatever `T` holds would corrupt it. The
+/// self-feed never requests a rollback: the add stamps the current tick, and the
+/// re-merged ring's past ticks are value-identical to what is already on file, so
+/// `InputQueue::add`'s novelty check returns `None`.
+fn store_authority_inputs<T: InputTrait, Tick: TickSource>(
+    mut query: Query<(&mut InputHistory<T>, &mut InputQueue<T>, &T), With<InputAuthority>>,
+    tick: Res<Tick>,
+    resimulating: Option<Res<Resimulating>>,
+) {
+    if resimulating.is_some() {
+        return;
+    }
+    for (mut hist, mut queue, input) in query.iter_mut() {
+        match hist.updated_at().partial_cmp(&(*tick).into()).unwrap() {
+            std::cmp::Ordering::Greater => {
+                hist.reset();
+            }
+            std::cmp::Ordering::Equal => {
+                continue;
+            }
+            std::cmp::Ordering::Less => {}
+        };
+        hist.write(*tick, input.clone());
+        queue.add(*tick, &hist);
+    }
+}
+
 fn send_inputs<T: InputTrait, Tick: TickSource>(
     mut messages: MessageWriter<ToClients<HistoryFor<T>>>,
-    query: Query<(Entity, &InputQueue<T>, Option<&T>, Has<InputAuthority>)>,
+    query: Query<(Entity, &InputQueue<T>)>,
     cur_tick: Res<Tick>,
 ) {
     let cur_tick = (*cur_tick).into();
-    for (entity, queue, current, authority) in query.iter() {
+    for (entity, queue) in query.iter() {
         if queue.past().any(|(t, _)| *t > cur_tick) {
             warn_once!(
                 "({:?}) Queue has past inputs with impossible (future) ticks: {:?}",
@@ -123,32 +166,28 @@ fn send_inputs<T: InputTrait, Tick: TickSource>(
                 queue
             );
         }
-        let mut future: ArrayVec<(u8, T), 7> = queue
+        let future: ArrayVec<(u8, T), 7> = queue
             .queue()
             .take(7)
             .filter(|(tick, _)| tick.get() >= cur_tick.get())
             .map(|(tick, t)| ((tick.get() - cur_tick.get()) as u8, t.clone()))
             .collect();
-        // A listen-server host drives its own (`InputAuthority`) body from live input
-        // that never enters the queue: the host never sends itself a `FromClient`
-        // message, so `receive_inputs` never feeds this body and the queue stays empty.
-        // Broadcast its current input directly so clients can replay the host's movement
-        // instead of seeing a frozen body. Guarded on an empty future so a body whose
-        // input *does* arrive via the queue (a remote client's) is untouched.
-        if authority && future.is_empty() {
-            if let Some(input) = current {
-                future.push((0, input.clone()));
-            }
+        let past: ArrayVec<(u8, T), 3> = queue
+            .past()
+            .map(|(tick, t)| ((cur_tick.get() - tick.get()) as u8, t.clone()))
+            .collect();
+        // A body whose queue has never been fed (e.g. an authority body before
+        // its first stored step) has nothing to say; an empty message would be
+        // pure traffic.
+        if past.is_empty() && future.is_empty() {
+            continue;
         }
         messages.write(ToClients {
             mode: SendMode::Broadcast,
             message: HistoryFor {
                 entity,
                 tick: cur_tick,
-                past: queue
-                    .past()
-                    .map(|(tick, t)| ((cur_tick.get() - tick.get()) as u8, t.clone()))
-                    .collect(),
+                past,
                 future,
             },
         });
@@ -156,10 +195,17 @@ fn send_inputs<T: InputTrait, Tick: TickSource>(
 }
 
 fn load_inputs<T: InputTrait, Tick: TickSource>(
-    mut query: Query<(&mut T, &mut InputQueue<T>, Has<InputAuthority>)>,
+    mut query: Query<(
+        &mut T,
+        &mut InputQueue<T>,
+        Option<&InputHistory<T>>,
+        Has<InputAuthority>,
+    )>,
     tick: Res<Tick>,
     confirmed: Res<ConfirmedHorizon>,
+    resimulating: Option<Res<Resimulating>>,
 ) {
+    let in_resim = resimulating.is_some();
     let sim_tick: RepliconTick = (*tick).into();
     // A remote (non-authority) body loads input at `min(sim_tick, confirmed)`: real
     // queued input at/before the confirmed tick (so resim reconstructs the confirmed
@@ -167,16 +213,28 @@ fn load_inputs<T: InputTrait, Tick: TickSource>(
     // `confirmed < sim_tick ≤ present`) — so the body EXTRAPOLATES from the confirmed
     // horizon to the present, symmetric with how a client extrapolates the host body,
     // rather than consuming the client's ahead-of-confirmed input it holds future-queued.
-    // The host's own (authority) body runs from live input (empty queue), so it loads at
-    // the present unchanged.
     let remote_tick = RepliconTick::new(sim_tick.get().min(confirmed.0));
-    for (mut input, mut input_queue, authority) in query.iter_mut() {
-        let at = if authority { sim_tick } else { remote_tick };
-        let found = input_queue.next(at);
-        if found.is_none() && authority {
+    for (mut input, mut input_queue, hist, authority) in query.iter_mut() {
+        if authority {
+            // The host's own body: the exact mirror of the client-side `load_inputs`
+            // authority arm. During forward simulation the live input (written by the
+            // application's per-tick capture) is authoritative — never overwritten —
+            // and the body's own tick is consumed from the self-fed queue purely so
+            // `InputQueue::past` carries the redundancy `send_inputs` broadcasts.
+            // During a rollback resim the recorded `InputHistory` is the canonical
+            // replay source (the self-fed queue was drained by forward consumption),
+            // ignoring the confirmed horizon: the host's own input needs no
+            // extrapolation, it is confirmed by definition.
+            if in_resim {
+                if let Some(historical) = hist.and_then(|h| h.get(sim_tick, false)) {
+                    *input = historical;
+                }
+            } else {
+                input_queue.next(sim_tick);
+            }
             continue;
         }
-        *input = found.unwrap_or_default();
+        *input = input_queue.next(remote_tick).unwrap_or_default();
     }
 }
 
@@ -431,13 +489,17 @@ mod tests {
     /// A remote (non-authority) body whose queue holds input both at the confirmed
     /// horizon and ahead of it (the present) must load the CONFIRMED-tick input — so
     /// it extrapolates the present from the confirmed horizon — while an authority
-    /// body ignores the horizon and loads at the present. This is what makes the
-    /// host's render of a remote body extrapolate symmetrically with the client's.
+    /// body ignores the horizon and replays at the simulated tick (its own input is
+    /// confirmed by definition). Run under `Resimulating` because that is when an
+    /// authority body loads at all: during forward simulation its live input is
+    /// authoritative and never overwritten. This is what makes the host's render of
+    /// a remote body extrapolate symmetrically with the client's.
     #[test]
     fn remote_body_loads_at_confirmed_horizon_authority_loads_at_present() {
         let mut app = App::new();
         app.add_systems(Update, load_inputs::<A, Tick>)
             .insert_resource(ConfirmedHorizon(5))
+            .insert_resource(Resimulating)
             .insert_resource(Tick(7));
 
         // Remote body: queue holds ticks 5 (A(10), confirmed), 6, 7 (A(30), present).
@@ -445,17 +507,169 @@ mod tests {
         queue.add(Tick(7), &hist(5, [A(10), A(20), A(30)]));
         let remote = app.world_mut().spawn((A(0), queue)).id();
 
-        // Authority body: same queue, but it loads at the present regardless.
-        let mut queue = InputQueue::<A>::default();
-        queue.add(Tick(7), &hist(5, [A(10), A(20), A(30)]));
-        let own = app.world_mut().spawn((A(0), queue, InputAuthority)).id();
+        // Authority body: same record in its own history; it replays at the
+        // simulated tick regardless of the horizon.
+        let own = app
+            .world_mut()
+            .spawn((
+                A(0),
+                InputQueue::<A>::default(),
+                hist(5, [A(10), A(20), A(30)]),
+                InputAuthority,
+            ))
+            .id();
 
         app.update();
 
         // Remote clamps to `min(present 7, confirmed 5) = 5` → tick 5's input.
         assert_eq!(A(10), *app.world().entity(remote).get::<A>().unwrap());
-        // Authority loads the present tick 7's input.
+        // Authority replays the simulated tick 7's input.
         assert_eq!(A(30), *app.world().entity(own).get::<A>().unwrap());
+    }
+
+    /// During forward simulation an authority body's live input must never be
+    /// overwritten by the load — the per-tick capture is the source of truth —
+    /// but its own tick is still consumed from the self-fed queue so the
+    /// consumed ring (`InputQueue::past`) carries the broadcast redundancy.
+    #[test]
+    fn authority_forward_load_keeps_live_input_and_consumes_queue() {
+        let mut app = App::new();
+        app.add_systems(Update, load_inputs::<A, Tick>)
+            .init_resource::<ConfirmedHorizon>()
+            .insert_resource(Tick(5));
+
+        let mut queue = InputQueue::<A>::default();
+        queue.add(Tick(5), &hist(5, [A(9)]));
+        let own = app
+            .world_mut()
+            .spawn((A(42), queue, hist(5, [A(9)]), InputAuthority))
+            .id();
+
+        app.update();
+
+        // Live input untouched (the queued A(9) would have clobbered the
+        // captured A(42) under the old unconditional assignment)...
+        assert_eq!(A(42), *app.world().entity(own).get::<A>().unwrap());
+        // ...but the tick was consumed into the redundancy ring.
+        assert_eq!(
+            vec![&(Tick(5).into(), A(9))],
+            app.world()
+                .entity(own)
+                .get::<InputQueue<A>>()
+                .unwrap()
+                .past()
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// The listen-server loopback: an `InputAuthority` body's live input is
+    /// recorded into its own history and fed through `InputQueue::add` — the same
+    /// entry point a client's `FromClient` message feeds — and `send_inputs` then
+    /// broadcasts it with the same consumed-ring redundancy a client body gets.
+    /// Three stored+consumed ticks must broadcast as three `past` entries, so a
+    /// client can lose up to two consecutive messages without a gap. This replaces
+    /// the former special case that sent the live input as a single, unprotected
+    /// `future` entry (one lost datagram = one permanently corrupted tick).
+    #[test]
+    fn authority_body_self_feeds_and_broadcasts_with_redundancy() {
+        let mut app = App::new();
+        app.add_message::<ToClients<HistoryFor<A>>>()
+            .init_resource::<ConfirmedHorizon>()
+            .add_systems(
+                Update,
+                (
+                    store_authority_inputs::<A, Tick>,
+                    load_inputs::<A, Tick>,
+                    send_inputs::<A, Tick>,
+                )
+                    .chain(),
+            )
+            .insert_resource(Tick(5));
+
+        let e = app
+            .world_mut()
+            .spawn((
+                A(1),
+                InputHistory::<A>::default(),
+                InputQueue::<A>::default(),
+                InputAuthority,
+            ))
+            .id();
+
+        for (tick, value) in [(5, 1), (6, 2), (7, 3)] {
+            app.insert_resource(Tick(tick));
+            app.world_mut().entity_mut(e).insert(A(value));
+            app.update();
+        }
+
+        let mut messages = app
+            .world()
+            .resource::<Messages<ToClients<HistoryFor<A>>>>()
+            .iter_current_update_messages();
+        assert_eq!(
+            HistoryFor {
+                entity: e,
+                tick: Tick(7).into(),
+                past: [(2u8, A(1)), (1, A(2)), (0, A(3))].into_iter().collect(),
+                future: default(),
+            },
+            messages.next().unwrap().message,
+            "three self-fed ticks must broadcast as a three-deep past-redundant message",
+        );
+        assert!(messages.next().is_none());
+    }
+
+    /// The self-feed must not run during a rollback resim: the recorded history is
+    /// what the resim replays, and re-recording the live `T` mid-resim would
+    /// corrupt it at the resimulated tick.
+    #[test]
+    fn self_feed_is_inert_during_resim() {
+        let mut app = App::new();
+        app.add_systems(Update, store_authority_inputs::<A, Tick>)
+            .insert_resource(Resimulating)
+            .insert_resource(Tick(9));
+
+        let recorded = hist(5, [A(1), A(2)]);
+        let e = app
+            .world_mut()
+            .spawn((
+                A(42),
+                recorded.clone(),
+                InputQueue::<A>::default(),
+                InputAuthority,
+            ))
+            .id();
+
+        app.update();
+
+        assert_eq!(
+            Some(&recorded),
+            app.world().entity(e).get::<InputHistory<A>>(),
+            "a resim step must not re-record the live input over the history it replays",
+        );
+    }
+
+    /// A body whose queue has never been fed broadcasts nothing — an empty
+    /// `HistoryFor` would be pure traffic and the client-side receive would do
+    /// nothing with it.
+    #[test]
+    fn send_inputs_skips_unfed_queue() {
+        let mut app = App::new();
+        app.add_message::<ToClients<HistoryFor<A>>>()
+            .add_systems(Update, send_inputs::<A, Tick>)
+            .insert_resource(Tick(5));
+        app.world_mut().spawn(InputQueue::<A>::default());
+
+        app.update();
+
+        assert!(
+            app.world()
+                .resource::<Messages<ToClients<HistoryFor<A>>>>()
+                .iter_current_update_messages()
+                .next()
+                .is_none(),
+            "an unfed queue has nothing to say",
+        );
     }
 
     #[test]

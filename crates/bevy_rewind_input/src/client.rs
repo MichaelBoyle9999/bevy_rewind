@@ -173,8 +173,14 @@ fn receive_inputs<T: InputTrait, Tick: TickSource>(
             past_iter.next(),
             past_iter.peek().map(|(rt, _)| *rt).unwrap_or_default(),
         ) {
-            // Expand each item into the inputs it caused
-            history.replace_section((until..=*rt).skip(1).rev().filter_map(|rrt| {
+            // Expand each item into the inputs it caused, including the item's
+            // own tick (`rrt == rt`). The range deliberately overlaps the next
+            // item's tick (`rrt == until`): that slot is first written as this
+            // item's repeat and then overwritten with the next item's exact
+            // value, which is what lets an offset-0 entry — the only coverage of
+            // the stamp tick in a past-only message, e.g. a listen-server host
+            // body's broadcast — land rather than being skipped.
+            history.replace_section((until..=*rt).rev().filter_map(|rrt| {
                 t.repeated((*rt - rrt) as u32)
                     .map(|t| (*tick - rrt as u32, t))
             }));
@@ -296,9 +302,11 @@ mod tests {
 
         app.update();
 
-        // The target entity needs to have history written
+        // The target entity needs to have history written. The future gap at
+        // tick 6 (offsets 0 and 2 sent, 1 missing) repeats the last known input
+        // A(3) rather than defaulting.
         let actual = app.world().entity(e1).get::<InputHistory<A>>();
-        let expected = hist(1, [A(1), A(1), A(1), A(2), A(3), A(0), A(4)]);
+        let expected = hist(1, [A(1), A(1), A(1), A(2), A(3), A(3), A(4)]);
         assert_eq!(Some(&expected), actual);
 
         // Other entities need to stay untouched
@@ -412,6 +420,48 @@ mod tests {
             Some(RepliconTick::new(6)),
             **app.world().resource::<RollbackTarget>(),
             "a diverging input must request a rollback to the mispredicted tick",
+        );
+    }
+
+    /// A lost broadcast must not plant `T::default()` in a remote body's history.
+    ///
+    /// The server broadcasts an `InputAuthority` (listen-server host) body's input
+    /// one tick per message with no redundancy (`server::send_inputs` pushes a
+    /// single `future` entry), on the unreliable channel. When the message for one
+    /// tick is lost — or the server's present skips a tick (a lead slew) — the next
+    /// message's stamp arrives with a gap, and `InputHistory::write` fills the gap
+    /// with `T::default()`. For a repeating input that is wrong twice over: the gap
+    /// tick replays as a spurious zero input (a walking body halts and snaps its
+    /// facing to default for one tick), and the documented "last input drives
+    /// forever" extrapolation contract says the gap should repeat the last known
+    /// input instead.
+    #[test]
+    fn receive_input_gap_from_lost_message_repeats_not_defaults() {
+        let mut app = diverge_app(8);
+        // Steady walk received through tick 5.
+        let e = app
+            .world_mut()
+            .spawn(hist(2, [A(1), A(1), A(1), A(1)]))
+            .id();
+
+        // The tick-6 broadcast was lost; tick 7's arrives (single future entry,
+        // exactly the host-body broadcast shape).
+        app.world_mut().write_message(HistoryFor {
+            entity: e,
+            tick: Tick(7).into(),
+            past: default(),
+            future: [(0u8, A(1))].into_iter().collect(),
+        });
+
+        app.update();
+
+        let history = app.world().entity(e).get::<InputHistory<A>>().unwrap();
+        assert_eq!(
+            Some(A(1)),
+            history.get(Tick(6), true),
+            "the gap tick left by a lost broadcast must repeat the last known input \
+             (the steady walk), not fall to T::default() — a defaulted tick replays \
+             as a one-tick halt + facing snap on the remote body",
         );
     }
 
