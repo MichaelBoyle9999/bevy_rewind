@@ -291,12 +291,17 @@ fn trigger_rollback<Tick: TickSource>(world: &mut World) {
     world.run_schedule(RollbackSchedule::Rollback);
     world.run_schedule(RollbackSchedule::PostRollback);
 
-    if start.get() > real_tick.get() {
-        let diff = start.get() - real_tick.get();
-        let mut fixed = world.resource_mut::<Time<Fixed>>();
-        let delta = fixed.delta();
-        fixed.discard_overstep(delta * diff);
-    }
+    // A future target (start > real_tick) loads just-arrived authoritative state
+    // and runs no resim ticks (the loop below is empty). It must NOT touch
+    // `Time<Fixed>`: the tick source is re-derived from the confirmed-tick
+    // estimate every `FixedPreUpdate`, so the present is owned by that clock, and
+    // discarding fixed-time overstep here (as this branch once did) permanently
+    // stole wall time from the simulation. On a client running behind the host —
+    // every real connection, via the stale connect seed — fresh confirms land
+    // ahead of the present every frame, so the discard fired repeatedly, starving
+    // fixed steps and compounding into runaway clock drift (input lateness,
+    // rendered delay, and overshoot of remote bodies). See
+    // `game/tests/clock_drift.rs`.
 
     // The first resimulated frame should be marked as already loaded
     world.insert_resource(AlreadyLoaded);

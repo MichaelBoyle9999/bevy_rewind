@@ -114,7 +114,7 @@ fn send_input_messages<T: InputTrait>(
 
 fn receive_inputs<T: InputTrait, Tick: TickSource>(
     mut messages: MessageReader<HistoryFor<T>>,
-    mut query: Query<&mut InputHistory<T>>,
+    mut query: Query<(&mut InputHistory<T>, Has<InputAuthority>)>,
     cur_tick: Res<Tick>,
     mut rollback_target: ResMut<RollbackTarget>,
 ) {
@@ -126,13 +126,28 @@ fn receive_inputs<T: InputTrait, Tick: TickSource>(
         future,
     } in messages.read()
     {
-        let Ok(mut history) = query.get_mut(*entity) else {
+        let Ok((mut history, authority)) = query.get_mut(*entity) else {
             warn_once!(
                 "Received history for entity without InputHistory: {}",
                 entity
             );
             continue;
         };
+
+        // The server broadcasts every body's history, including this client's own —
+        // and for the input-owning client that echo is a *stale round trip*, not new
+        // information: it reflects only the inputs the server had consumed when it
+        // sent, lagging the live history by the full RTT. Writing it would
+        // retroactively zero real recorded inputs (the server repeats its last
+        // consumed input over ticks it hasn't received yet), trigger a bogus
+        // misprediction rollback to the zeroed tick, resim the body from rest, and
+        // ship the corrupted history back to the server — whose "newest message
+        // wins" merge then erases the genuine inputs from its queue and freezes the
+        // body authoritatively. Local recorded input is authoritative for an
+        // `InputAuthority` body; never accept the echo.
+        if authority {
+            continue;
+        }
 
         // Resim a remote body only on a genuine *misprediction* — the client-side
         // mirror of the server's `InputQueue::add` divergence check. We extrapolate
@@ -290,6 +305,44 @@ mod tests {
         let actual = app.world().entity(e2).get::<InputHistory<A>>();
         let expected = hist(0, []);
         assert_eq!(Some(&expected), actual);
+    }
+
+    /// The server's broadcast of a client's *own* body history is a stale echo:
+    /// it can only repeat what the server has consumed, lagging the live record
+    /// by the full round trip. Accepting it overwrites genuinely recorded inputs
+    /// with the server's input-repeat (zeros over ticks still in flight) and
+    /// requests a bogus rollback to the overwritten tick — the corruption loop
+    /// that froze a driven body under bursty delivery (see
+    /// `game/tests/netcode_invariants_proptest.rs`, Schedule band). An
+    /// `InputAuthority` entity's history must be left untouched.
+    #[test]
+    fn receive_input_ignores_echo_for_own_authority_body() {
+        let mut app = diverge_app(8);
+        // Locally recorded walk: ticks 2..=5 = A(1).
+        let local = hist(2, [A(1), A(1), A(1), A(1)]);
+        let e = app.world_mut().spawn((local.clone(), InputAuthority)).id();
+
+        // The server echoes its stale view: tick 4 = A(0) (it never saw the walk).
+        app.world_mut().write_message(HistoryFor {
+            entity: e,
+            tick: Tick(4).into(),
+            past: default(),
+            future: [(0u8, A(0))].into_iter().collect(),
+        });
+
+        app.update();
+
+        assert_eq!(
+            Some(&local),
+            app.world().entity(e).get::<InputHistory<A>>(),
+            "an InputAuthority body's locally recorded history must not be \
+             overwritten by the server's round-tripped echo",
+        );
+        assert_eq!(
+            None,
+            **app.world().resource::<RollbackTarget>(),
+            "a stale echo of our own input must not request a rollback",
+        );
     }
 
     /// Build a single-system app exercising the client `receive_inputs`
