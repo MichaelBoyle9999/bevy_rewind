@@ -589,6 +589,19 @@ pub trait RollbackApp {
     >(
         &mut self,
     ) -> &mut Self;
+    /// Register an authoritative component whose divergence gate uses `tolerance`
+    /// rather than exact equality: a confirmed-vs-predicted difference within
+    /// tolerance is not treated as a misprediction and does not trigger a
+    /// rollback. For a non-deterministic float simulation this is what keeps
+    /// cross-process drift below the sim's non-determinism floor from firing a
+    /// chronic, spurious rollback every tick. History de-duplication is unchanged
+    /// (still exact `PartialEq`).
+    fn register_authoritative_component_with_tolerance<
+        T: Component<Mutability = Mutable> + Clone + Debug + PartialEq,
+    >(
+        &mut self,
+        tolerance: fn(&T, &T) -> bool,
+    ) -> &mut Self;
     /// Register a predicted-only resource
     fn register_predicted_resource<T: Resource + Clone + Debug>(&mut self) -> &mut Self;
 
@@ -634,6 +647,24 @@ impl RollbackApp for App {
         &mut self,
     ) -> &mut Self {
         self.register_predicted_component::<T>();
+
+        self.set_marker_fns::<Predicted, T>(
+            history::write_authoritative_history,
+            history::remove_authoritative_history::<T>,
+        )
+    }
+    fn register_authoritative_component_with_tolerance<
+        T: Component<Mutability = Mutable> + Clone + Debug + PartialEq,
+    >(
+        &mut self,
+        tolerance: fn(&T, &T) -> bool,
+    ) -> &mut Self {
+        let mut registry = self
+            .world_mut()
+            .remove_resource::<RollbackRegistry>()
+            .unwrap();
+        registry.register_with_tolerance::<T>(self.world_mut(), tolerance);
+        self.world_mut().insert_resource(registry);
 
         self.set_marker_fns::<Predicted, T>(
             history::write_authoritative_history,

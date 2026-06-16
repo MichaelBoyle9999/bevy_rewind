@@ -65,4 +65,18 @@ impl RollbackRegistry {
         self.components
             .push(HistoryComponent::with_load::<T>(load_fn));
     }
+
+    /// Register a component whose divergence gate uses `tolerance` instead of
+    /// exact equality: a confirmed-vs-predicted difference within tolerance does
+    /// not warrant a rollback. History de-duplication still uses exact `PartialEq`.
+    pub fn register_with_tolerance<T: Component + Clone + PartialEq>(
+        &mut self,
+        world: &mut World,
+        tolerance: fn(&T, &T) -> bool,
+    ) {
+        let id = world.register_component::<T>();
+        self.ids.insert(id, self.components.len());
+        self.components
+            .push(HistoryComponent::new::<T>().with_tolerance::<T>(tolerance));
+    }
 }

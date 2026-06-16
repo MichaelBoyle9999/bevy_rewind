@@ -299,7 +299,10 @@ fn entity_diverged(
                     TickData::Value(pred_value) => {
                         // SAFETY: both pointers come from histories registered
                         // under `comp_id`, which is what `component` describes.
-                        if !unsafe { component.equal(auth_value, pred_value) } {
+                        // Tolerance-aware: a difference within the component's
+                        // registered tolerance is not a divergence, so float noise
+                        // below the sim's non-determinism floor never rolls back.
+                        if !unsafe { component.within_tolerance(auth_value, pred_value) } {
                             return true;
                         }
                     }
