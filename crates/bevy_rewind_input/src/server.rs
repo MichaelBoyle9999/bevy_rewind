@@ -109,6 +109,7 @@ fn receive_inputs<T: InputTrait, Tick: TickSource>(
     mut messages: MessageReader<FromClient<InputHistory<T>>>,
     mut query: Query<&mut InputQueue<T>>,
     cur_tick: Res<Tick>,
+    confirmed: Res<crate::ConfirmedHorizon>,
     mut rollback_target: ResMut<RollbackTarget>,
 ) {
     for FromClient { client_id, message } in messages.read() {
@@ -125,17 +126,40 @@ fn receive_inputs<T: InputTrait, Tick: TickSource>(
         if let Some(target) = input_queue.add(*cur_tick, message) {
             // Eager rollback: a client input arrived stamped for a tick in our
             // past. Request a rollback to that tick so the resim picks up the
-            // newly-merged late input. Per-system order: this runs in PreUpdate;
-            // `calculate_rollback_target` runs later in `RunFixedMainLoop` and
-            // both clamps to the rollback window and takes a min over any
-            // replicon-confirm-driven target, so writing the raw past tick here
-            // composes correctly with state-confirm rollbacks.
-            **rollback_target = Some(match **rollback_target {
-                Some(prev) => prev.min(target),
-                None => target,
-            });
+            // newly-merged late input — UNLESS the tick is already sealed. The
+            // host runs its present ahead of the confirmed/replicated `ServerTick`
+            // (`ConfirmedHorizon`); a tick at or below `ServerTick -
+            // SEAL_GRACE_TICKS` has already been simulated and replicated as
+            // authoritative, so rolling back to it would rewrite replicated history
+            // and re-ship a corrected value to every client. Such a too-late input
+            // is discarded (the standard server dejitter policy): it stays merged in
+            // the queue at its stamped tick for `received_horizon` bookkeeping, but
+            // being below the resim floor it is never consumed. The default sentinel
+            // (`u32::MAX`) means "no seal published yet" — e.g. before the host's
+            // first fixed step — and leaves the eager path unguarded, preserving the
+            // zero-latency depth-1 rollback (its input lands within the grace).
+            //
+            // Per-system order: this runs in PreUpdate; `calculate_rollback_target`
+            // runs later in `RunFixedMainLoop` and both clamps to the rollback
+            // window and takes a min over any replicon-confirm-driven target, so
+            // writing the raw past tick here composes correctly with state-confirm
+            // rollbacks.
+            if !sealed(target, *confirmed) {
+                **rollback_target = Some(match **rollback_target {
+                    Some(prev) => prev.min(target),
+                    None => target,
+                });
+            }
         }
     }
+}
+
+/// Whether `target` falls in already-sealed (simulated-and-replicated) territory
+/// the host must not roll back to revise: at or below `ConfirmedHorizon -
+/// SEAL_GRACE_TICKS`. The default `ConfirmedHorizon` (`u32::MAX`) means no seal has
+/// been published, so nothing is sealed.
+fn sealed(target: RepliconTick, confirmed: crate::ConfirmedHorizon) -> bool {
+    confirmed.0 != u32::MAX && target.get() <= confirmed.0.saturating_sub(crate::SEAL_GRACE_TICKS)
 }
 
 /// Record an `InputAuthority` body's live input into its own history and queue,
@@ -286,6 +310,7 @@ mod tests {
         app.add_message::<FromClient<InputHistory<A>>>()
             .add_systems(Update, receive_inputs::<A, Tick>)
             .init_resource::<RollbackTarget>()
+            .init_resource::<ConfirmedHorizon>()
             .insert_resource(Tick(5));
 
         app.world_mut().write_message_batch([
@@ -377,6 +402,7 @@ mod tests {
         app.add_message::<FromClient<InputHistory<A>>>()
             .add_systems(Update, receive_inputs::<A, Tick>)
             .init_resource::<RollbackTarget>()
+            .init_resource::<ConfirmedHorizon>()
             .insert_resource(Tick(20));
 
         // Seed a pre-existing rollback target (as if a state confirm had already
@@ -424,6 +450,7 @@ mod tests {
         app.add_message::<FromClient<InputHistory<A>>>()
             .add_systems(Update, receive_inputs::<A, Tick>)
             .init_resource::<RollbackTarget>()
+            .init_resource::<ConfirmedHorizon>()
             .insert_resource(Tick(5));
 
         app.world_mut().write_message(FromClient {
@@ -433,6 +460,91 @@ mod tests {
         app.update();
 
         assert_eq!(None, **app.world().resource::<RollbackTarget>());
+    }
+
+    /// Seal guard: a client input stamped at or below the sealed horizon
+    /// (`ConfirmedHorizon - SEAL_GRACE_TICKS`) is too late to revise authoritative
+    /// state — the host has already simulated and replicated those ticks — so it must
+    /// NOT request a rollback. Without the guard the host rewinds below its replicated
+    /// `ServerTick` and re-ships a corrected value to every client, the asymmetric
+    /// move→stop overshoot.
+    #[test]
+    fn receive_inputs_seals_too_late_input() {
+        let mut app = App::new();
+        let e = app.world_mut().spawn(InputQueue::<A>::default()).id();
+        app.add_message::<FromClient<InputHistory<A>>>()
+            .add_systems(Update, receive_inputs::<A, Tick>)
+            .init_resource::<RollbackTarget>()
+            // Horizon 10, grace 2 → sealed floor at tick 8.
+            .insert_resource(ConfirmedHorizon(10))
+            .insert_resource(Tick(15));
+
+        // Novel past tick 8 == 10 - SEAL_GRACE_TICKS(2): sealed, must be dropped.
+        app.world_mut().write_message(FromClient {
+            client_id: ClientId::Client(e),
+            message: hist(8, [A(1)]),
+        });
+        app.update();
+
+        assert_eq!(
+            None,
+            **app.world().resource::<RollbackTarget>(),
+            "an input for an already-sealed tick must not request a rollback",
+        );
+    }
+
+    /// The complement: an input just *above* the sealed horizon lands in the host's
+    /// unsealed lead window, so a genuinely-late but not-yet-replicated input must
+    /// still request a rollback and be applied.
+    #[test]
+    fn receive_inputs_rolls_back_unsealed_input() {
+        let mut app = App::new();
+        let e = app.world_mut().spawn(InputQueue::<A>::default()).id();
+        app.add_message::<FromClient<InputHistory<A>>>()
+            .add_systems(Update, receive_inputs::<A, Tick>)
+            .init_resource::<RollbackTarget>()
+            .insert_resource(ConfirmedHorizon(10))
+            .insert_resource(Tick(15));
+
+        // Novel past tick 9 > 8: unsealed, must roll back.
+        app.world_mut().write_message(FromClient {
+            client_id: ClientId::Client(e),
+            message: hist(9, [A(1)]),
+        });
+        app.update();
+
+        assert_eq!(
+            Some(RepliconTick::new(9)),
+            **app.world().resource::<RollbackTarget>(),
+            "an input above the sealed horizon must still request a rollback",
+        );
+    }
+
+    /// With no seal published yet (`ConfirmedHorizon` at its `u32::MAX` default —
+    /// e.g. before the host's first fixed step), the eager path is unguarded: even a
+    /// deep past input rolls back, preserving the prior behaviour and the
+    /// zero-latency depth-1 rollback.
+    #[test]
+    fn receive_inputs_unsealed_when_horizon_unset() {
+        let mut app = App::new();
+        let e = app.world_mut().spawn(InputQueue::<A>::default()).id();
+        app.add_message::<FromClient<InputHistory<A>>>()
+            .add_systems(Update, receive_inputs::<A, Tick>)
+            .init_resource::<RollbackTarget>()
+            .init_resource::<ConfirmedHorizon>()
+            .insert_resource(Tick(15));
+
+        app.world_mut().write_message(FromClient {
+            client_id: ClientId::Client(e),
+            message: hist(4, [A(1)]),
+        });
+        app.update();
+
+        assert_eq!(
+            Some(RepliconTick::new(4)),
+            **app.world().resource::<RollbackTarget>(),
+            "with no seal published the eager path must remain unguarded",
+        );
     }
 
     #[test]

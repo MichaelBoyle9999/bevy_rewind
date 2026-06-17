@@ -12,7 +12,18 @@ use serde::{Deserialize, Serialize};
 /// `T::default()` for ticks outside the ring — which would silently lose
 /// movement on a remote body. Public so consumers can put a compile-time
 /// canary against it; see `game/src/networking/components.rs`.
-pub const INPUT_HISTORY_CAPACITY: usize = 20;
+///
+/// Sized so the *seal delay* (the lead, how far the host runs its present ahead
+/// of the confirmed tick — `MAX_LEAD_TICKS = INPUT_HISTORY_CAPACITY −
+/// DEFAULT_ROLLBACK_FRAMES`) covers a realistic worst-case ping. At 60 Hz a 10-tick
+/// one-way lead absorbs ≈167 ms each way (≈333 ms RTT), so a client's input still
+/// reaches the host's present in time to be applied in the unsealed lead window
+/// rather than landing below the sealed `ServerTick` (which would force the host to
+/// revise already-replicated authoritative state — the asymmetric move→stop
+/// overshoot). Bumped from 20 (a 5-tick lead, which clamped above ≈183 ms RTT) so
+/// "weird geography" pings of 160 ms+ stay in the healthy regime. The lead/ring
+/// sizes are flagged for the on-device feel pass.
+pub const INPUT_HISTORY_CAPACITY: usize = 25;
 
 /// The input history for an input. Used when sending data to the server, also useful for rollback
 #[derive(Message, Component, Clone, TypePath, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -235,8 +246,8 @@ pub(super) mod tests {
         assert_eq!(hist(15, [A(1), A(2), A(2), A(2), A(2), A(6)]), history);
 
         // When the gap exceeds capacity, the old history is cleared. Gap must
-        // exceed `INPUT_HISTORY_CAPACITY` (20), so write at tick 41 (gap 21).
-        history.write(Tick(41), A(10));
+        // exceed `INPUT_HISTORY_CAPACITY` (25), so write at tick 46 (gap 26).
+        history.write(Tick(46), A(10));
         assert_eq!(1, history.list.len());
     }
 

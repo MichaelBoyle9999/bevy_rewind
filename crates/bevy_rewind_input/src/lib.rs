@@ -143,6 +143,24 @@ impl Default for ConfirmedHorizon {
     }
 }
 
+/// How many ticks below the confirmed horizon (`ServerTick`) the host will still
+/// roll back to apply a late client input — the input-pipeline depth (a client
+/// input for tick `T` is received and processed the frame after the host
+/// simulated `T`, so even at zero latency the eager path reaches one tick back)
+/// plus a small jitter margin.
+///
+/// An input stamped at or below `ConfirmedHorizon - SEAL_GRACE_TICKS` is *sealed*:
+/// the host has already simulated and replicated those ticks as authoritative, so
+/// rolling back to apply it would rewrite replicated history and re-ship a
+/// corrected value to every client (the asymmetric move→stop overshoot). The host
+/// instead **discards** such a too-late input — the standard server-authoritative
+/// dejitter policy. This bounds how far below the sealed tick the host may revise
+/// authoritative state to `SEAL_GRACE_TICKS`, regardless of ping; combined with a
+/// lead sized to cover the one-way trip (see `INPUT_HISTORY_CAPACITY`), inputs
+/// normally land *above* the horizon and the guard only fires on jitter outliers.
+/// Flagged for the on-device feel pass.
+pub const SEAL_GRACE_TICKS: u32 = 2;
+
 #[derive(Message, Clone, TypePath, Serialize, Deserialize, PartialEq, Eq, Debug)]
 #[serde(bound(deserialize = "T: for<'de2> serde::Deserialize<'de2>"))]
 struct HistoryFor<T: InputTrait> {
