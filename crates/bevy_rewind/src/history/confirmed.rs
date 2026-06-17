@@ -27,8 +27,28 @@ use bevy_replicon::{
     shared::replicon_tick::RepliconTick,
 };
 
+use serde::{Deserialize, Serialize};
+
 use super::component_history::TickData;
 use super::predicted::PredictedHistory;
+
+/// Per-body horizon: the highest tick for which this body's *real* input was
+/// received, beyond which its simulated state is the last input repeated forward
+/// (a guess). Set by the input layer on the authority and **replicated** to every
+/// observer. An observer refuses to reconcile a body to authoritative state past
+/// this tick (see `load.rs`), keeping its own prediction instead of snapping to a
+/// guess — the host's extrapolation overshoot that nudged a peer's body on
+/// correction. It must be replicated explicitly because an observer otherwise
+/// cannot tell an unconfirmed (extrapolated) tick from an idle-unchanged one.
+///
+/// Absent ⇒ no cap (the prior behaviour), correct for a body whose own input is
+/// always live (the listen-server host's own body) and for the window before a
+/// body's first input arrives. The horizon inherently trails `ServerTick` by the
+/// input pipeline even at zero network latency, which is exactly why the observer
+/// must *keep its prediction* past it rather than the host withholding the value
+/// (which, trailing every tick, would freeze the body's authority entirely).
+#[derive(Component, Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ConfirmedInputHorizon(pub u32);
 
 /// Install the confirmed replication source on this app.
 ///

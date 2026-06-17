@@ -9,6 +9,12 @@ use bevy_replicon::shared::replicon_tick::RepliconTick;
 pub struct InputQueue<T: InputTrait> {
     past: ArrayDeque<(RepliconTick, T), 3, Wrapping>,
     queue: ArrayDeque<(RepliconTick, T), 30>,
+    /// Highest tick for which this body's *real* (received, not extrapolated)
+    /// input has ever been merged in via [`Self::add`]. This is the body's
+    /// confirmed-input horizon: past it the simulator only has the last input
+    /// *repeated forward* (a guess), so authoritative state there must not be
+    /// asserted. `None` until the first input arrives.
+    received_horizon: Option<RepliconTick>,
 }
 
 impl<T: InputTrait> Default for InputQueue<T> {
@@ -16,6 +22,7 @@ impl<T: InputTrait> Default for InputQueue<T> {
         Self {
             past: ArrayDeque::new(),
             queue: ArrayDeque::new(),
+            received_horizon: None,
         }
     }
 }
@@ -27,6 +34,13 @@ impl<T: InputTrait> InputQueue<T> {
 
     pub(crate) fn queue(&self) -> impl Iterator<Item = &(RepliconTick, T)> {
         self.queue.iter()
+    }
+
+    /// The highest tick for which real input has been received — the body's
+    /// confirmed-input horizon. Authoritative state beyond this tick is
+    /// extrapolation (a repeated guess) and must not be confirmed.
+    pub fn received_horizon(&self) -> Option<RepliconTick> {
+        self.received_horizon
     }
 
     /// Merge an incoming input history into the queue. Past-tick history
@@ -60,6 +74,14 @@ impl<T: InputTrait> InputQueue<T> {
         let cur_tick = tick.into();
         let history_first = history.first_tick();
         let history_last = history.updated_at();
+
+        // Record the body's confirmed-input horizon: the highest tick we have ever
+        // been told real input for. Everything the simulator runs past this is the
+        // last input repeated forward (a guess), which must not be confirmed.
+        self.received_horizon = Some(match self.received_horizon {
+            Some(prev) if prev >= history_last => prev,
+            _ => history_last,
+        });
 
         // Highest tick we've ever called `next()` for. Anything <= this is
         // either already consumed or was skipped as late (and either way the

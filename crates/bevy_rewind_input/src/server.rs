@@ -10,7 +10,7 @@ use crate::{
 use arrayvec::ArrayVec;
 use bevy::{ecs::schedule::InternedScheduleLabel, prelude::*};
 use bevy_replicon::{prelude::*, shared::replicon_tick::RepliconTick};
-use bevy_rewind::{Resimulating, RollbackTarget};
+use bevy_rewind::{ConfirmedInputHorizon, Resimulating, RollbackTarget};
 
 pub(super) struct InputQueueServerPlugin<T: InputTrait, Tick: TickSource> {
     schedule: InternedScheduleLabel,
@@ -49,11 +49,37 @@ impl<T: InputTrait, Tick: TickSource> Plugin for InputQueueServerPlugin<T, Tick>
         )
         .add_systems(
             PostUpdate,
-            send_inputs::<T, Tick>
+            (publish_confirmed_input_horizon::<T>, send_inputs::<T, Tick>)
                 .run_if(in_state(ServerState::Running))
                 .before(ServerSystems::Send)
                 .in_set(InputQueueSet::Network),
         );
+    }
+}
+
+/// Publish each body's received-input horizon (from its [`InputQueue`]) onto a
+/// [`ConfirmedInputHorizon`] component. Once replicated, every observer (including
+/// the body's own client) refuses to reconcile the body to authoritative state
+/// past it — trusting its own prediction instead of the host's extrapolated guess.
+/// Runs server-side before `ServerSystems::Send`, after the tick's inputs have
+/// been received (`PreUpdate`) and self-fed (sim schedule). The host's own body
+/// self-feeds at the present each tick, so its horizon never lags `ServerTick`
+/// and it is never restricted; a client body's horizon lags by the uplink delay,
+/// capping reconciliation to its real input.
+fn publish_confirmed_input_horizon<T: InputTrait>(
+    mut commands: Commands,
+    query: Query<(Entity, &InputQueue<T>, Option<&ConfirmedInputHorizon>)>,
+) {
+    for (entity, queue, existing) in &query {
+        let Some(horizon) = queue.received_horizon() else {
+            continue;
+        };
+        let horizon = horizon.get();
+        if existing.map(|c| c.0) != Some(horizon) {
+            commands
+                .entity(entity)
+                .insert(ConfirmedInputHorizon(horizon));
+        }
     }
 }
 

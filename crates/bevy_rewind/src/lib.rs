@@ -1,7 +1,10 @@
 //! A crate for generic rollback handling in bevy
 
 mod history;
-pub use history::{AuthoritativeHistory, ExistingOrUninit, install_confirmed_replication_source};
+pub use history::{
+    AuthoritativeHistory, ConfirmedInputHorizon, ExistingOrUninit,
+    install_confirmed_replication_source,
+};
 use history::{LoadFn, RollbackRegistry};
 
 mod predicted_resource;

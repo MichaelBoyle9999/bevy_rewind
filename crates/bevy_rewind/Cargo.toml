@@ -9,3 +9,4 @@ workspace = true
 [dependencies]
 bevy.workspace = true
 bevy_replicon = { workspace = true, features = ["client"] }
+serde.workspace = true

@@ -3,6 +3,7 @@ use super::{
     authoritative::AuthoritativeHistory,
     batch::{InsertBatch, RemoveBatch},
     component_history::TickData,
+    confirmed::ConfirmedInputHorizon,
     predicted::PredictedHistory,
 };
 use crate::{LoadFrom, Predicted, RollbackLoadSet, RollbackSchedule};
@@ -42,6 +43,7 @@ fn load_and_clear_prediction(
             Entity,
             &mut PredictedHistory,
             Option<(&AuthoritativeHistory, &ConfirmHistory)>,
+            Option<&ConfirmedInputHorizon>,
             Has<Disabled>,
         ),
         (With<Predicted>, Or<(With<Disabled>, Without<Disabled>)>),
@@ -57,26 +59,33 @@ fn load_and_clear_prediction(
     let mut removes = RemoveBatch::new();
 
     // TODO: Can we par_iter this?
-    for (entity, mut predicted, maybe_authoritative, is_disabled) in q.iter_mut() {
+    for (entity, mut predicted, maybe_authoritative, horizon, is_disabled) in q.iter_mut() {
+        // Past the body's received-input horizon the authority is a guess; keep the
+        // prediction (treat auth as Missing) rather than reconcile to it.
+        let beyond_horizon = horizon.is_some_and(|h| previous_tick.get() > h.0);
         let mut load_commands = Commands::new_from_entities(&mut load_queue, e_alloc, entities);
         for (&comp_id, pred_hist) in predicted.iter_mut() {
             let &reg_idx = registry.ids.get(&comp_id).unwrap();
             let component = registry.components.get(reg_idx).unwrap();
 
-            let auth = maybe_authoritative
-                .map(|(authoritative, confirmed)| {
-                    if let Some(auth_hist) = authoritative.get(&comp_id) {
-                        let check_range = auth_hist.empty_after(previous_tick.get());
-                        let end_tick = RepliconTick::new(previous_tick.get() + check_range);
-                        if confirmed.contains_any(**previous_tick, end_tick)
-                            || global_confirm.contains_any(**previous_tick, end_tick)
-                        {
-                            return auth_hist.get_latest(previous_tick.get());
+            let auth = if beyond_horizon {
+                TickData::Missing
+            } else {
+                maybe_authoritative
+                    .map(|(authoritative, confirmed)| {
+                        if let Some(auth_hist) = authoritative.get(&comp_id) {
+                            let check_range = auth_hist.empty_after(previous_tick.get());
+                            let end_tick = RepliconTick::new(previous_tick.get() + check_range);
+                            if confirmed.contains_any(**previous_tick, end_tick)
+                                || global_confirm.contains_any(**previous_tick, end_tick)
+                            {
+                                return auth_hist.get_latest(previous_tick.get());
+                            }
                         }
-                    }
-                    TickData::Missing
-                })
-                .unwrap_or(TickData::Missing);
+                        TickData::Missing
+                    })
+                    .unwrap_or(TickData::Missing)
+            };
 
             let pred = pred_hist.get_latest(previous_tick.get());
 
@@ -132,9 +141,10 @@ fn load_confirmed_authoritative(
     mut commands: Commands,
     mut q: Query<
         (
-            EntityMutExcept<(AuthoritativeHistory, ConfirmHistory)>,
+            EntityMutExcept<(AuthoritativeHistory, ConfirmHistory, ConfirmedInputHorizon)>,
             &AuthoritativeHistory,
             &ConfirmHistory,
+            Option<&ConfirmedInputHorizon>,
         ),
         (With<Predicted>, Or<(With<Disabled>, Without<Disabled>)>),
     >,
@@ -149,7 +159,12 @@ fn load_confirmed_authoritative(
     let mut removes = RemoveBatch::new();
 
     // TODO: Can we par_iter this?
-    for (entity, authoritative, confirmed) in q.iter_mut() {
+    for (entity, authoritative, confirmed, horizon) in q.iter_mut() {
+        // Past the body's received-input horizon the authority is a guess; keep the
+        // resim's own prediction for this body rather than reconciling to it.
+        if horizon.is_some_and(|h| previous_tick.get() > h.0) {
+            continue;
+        }
         let mut load_commands = Commands::new_from_entities(&mut load_queue, e_alloc, entities);
         for (&comp_id, auth_hist) in authoritative.iter() {
             let &reg_idx = registry.ids.get(&comp_id).unwrap();
@@ -211,6 +226,7 @@ pub(crate) type DivergenceQuery<'w, 's> = Query<
         &'static PredictedHistory,
         &'static AuthoritativeHistory,
         &'static ConfirmHistory,
+        Option<&'static ConfirmedInputHorizon>,
     ),
     With<Predicted>,
 >;
@@ -244,8 +260,8 @@ pub(crate) fn rollback_would_change_state(
 ) -> bool {
     let lo = start.get().saturating_sub(1);
     let hi = real_tick.get().saturating_sub(1);
-    q.iter().any(|(pred, auth, confirm)| {
-        entity_diverged(pred, auth, confirm, registry, global_confirm, lo, hi)
+    q.iter().any(|(pred, auth, confirm, horizon)| {
+        entity_diverged(pred, auth, confirm, horizon, registry, global_confirm, lo, hi)
     })
 }
 
@@ -257,6 +273,7 @@ fn entity_diverged(
     pred: &PredictedHistory,
     auth: &AuthoritativeHistory,
     confirm: &ConfirmHistory,
+    horizon: Option<&ConfirmedInputHorizon>,
     registry: &RollbackRegistry,
     global_confirm: &ServerMutateTicks,
     lo: u32,
@@ -268,6 +285,11 @@ fn entity_diverged(
         let pred_hist = pred.get(&comp_id);
 
         for p in lo..=hi {
+            // Past the body's received-input horizon the authority is a guess, not
+            // a misprediction to correct — skip it so it never triggers a rollback.
+            if horizon.is_some_and(|h| p > h.0) {
+                continue;
+            }
             let previous_tick = RepliconTick::new(p);
             let check_range = auth_hist.empty_after(p);
             let end_tick = RepliconTick::new(p + check_range);
@@ -770,7 +792,7 @@ mod tests {
     /////      divergence-gate (rollback) tests    //////
     ///////////////////////////////////////////////////
 
-    use super::{DivergenceQuery, entity_diverged, rollback_would_change_state};
+    use super::{ConfirmedInputHorizon, DivergenceQuery, entity_diverged, rollback_would_change_state};
 
     /// Build a registry with `C` registered and return the matching `ComponentId`.
     fn registry_with<C: Component + Clone + PartialEq>() -> (RollbackRegistry, ComponentId) {
@@ -793,7 +815,7 @@ mod tests {
         let confirm = confirm_history([0]);
 
         assert!(entity_diverged(
-            &pred, &auth, &confirm, &registry, &global, 0, 0
+            &pred, &auth, &confirm, None, &registry, &global, 0, 0
         ));
     }
 
@@ -809,7 +831,7 @@ mod tests {
         let confirm = confirm_history([0]);
 
         assert!(!entity_diverged(
-            &pred, &auth, &confirm, &registry, &global, 0, 0
+            &pred, &auth, &confirm, None, &registry, &global, 0, 0
         ));
     }
 
@@ -825,7 +847,7 @@ mod tests {
         let confirm = confirm_history([0]);
 
         assert!(entity_diverged(
-            &pred, &auth, &confirm, &registry, &global, 0, 0
+            &pred, &auth, &confirm, None, &registry, &global, 0, 0
         ));
     }
 
@@ -841,7 +863,7 @@ mod tests {
         let confirm = confirm_history([0]);
 
         assert!(!entity_diverged(
-            &pred, &auth, &confirm, &registry, &global, 0, 0
+            &pred, &auth, &confirm, None, &registry, &global, 0, 0
         ));
     }
 
@@ -858,7 +880,7 @@ mod tests {
         let confirm = confirm_history([0, 2]);
 
         assert!(!entity_diverged(
-            &pred, &auth, &confirm, &registry, &global, 1, 1
+            &pred, &auth, &confirm, None, &registry, &global, 1, 1
         ));
     }
 
@@ -875,7 +897,7 @@ mod tests {
         let confirm = confirm_history([]); // unconfirmed on the entity
 
         assert!(entity_diverged(
-            &pred, &auth, &confirm, &registry, &global, 0, 0
+            &pred, &auth, &confirm, None, &registry, &global, 0, 0
         ));
     }
 
@@ -892,7 +914,59 @@ mod tests {
         let confirm = confirm_history([0, 1, 2]);
 
         assert!(entity_diverged(
-            &pred, &auth, &confirm, &registry, &global, 0, 2
+            &pred, &auth, &confirm, None, &registry, &global, 0, 2
+        ));
+    }
+
+    /// A divergence past the body's received-input horizon is not a misprediction
+    /// to correct — the authority there is the last input repeated forward (a
+    /// guess) — so the gate must not report it.
+    #[test]
+    fn entity_not_diverged_past_confirmed_input_horizon() {
+        let (registry, comp_a) = registry_with::<A>();
+        let global = ServerMutateTicks::default();
+
+        // Matches at ticks 0,1; the authority diverges at tick 2.
+        let pred = pred_history(0, comp_a, [a(5), a(5), a(5)]);
+        let auth = auth_history(0, comp_a, [a(5), a(5), a(9)]);
+        let confirm = confirm_history([0, 1, 2]);
+        // Real input only through tick 1 → tick 2 is a guess.
+        let horizon = ConfirmedInputHorizon(1);
+
+        assert!(!entity_diverged(
+            &pred,
+            &auth,
+            &confirm,
+            Some(&horizon),
+            &registry,
+            &global,
+            0,
+            2,
+        ));
+    }
+
+    /// A divergence at or before the received-input horizon is real input, not a
+    /// guess, so it is still reported (the cap restricts only the guessed window).
+    #[test]
+    fn entity_diverged_within_confirmed_input_horizon() {
+        let (registry, comp_a) = registry_with::<A>();
+        let global = ServerMutateTicks::default();
+
+        let pred = pred_history(0, comp_a, [a(5), a(5), a(5)]);
+        let auth = auth_history(0, comp_a, [a(5), a(5), a(9)]);
+        let confirm = confirm_history([0, 1, 2]);
+        // Real input through tick 2 → the divergence there is genuine.
+        let horizon = ConfirmedInputHorizon(2);
+
+        assert!(entity_diverged(
+            &pred,
+            &auth,
+            &confirm,
+            Some(&horizon),
+            &registry,
+            &global,
+            0,
+            2,
         ));
     }
 

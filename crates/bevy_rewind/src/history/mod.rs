@@ -15,7 +15,7 @@ pub use predicted::PredictedHistory;
 
 mod batch;
 mod confirmed;
-pub use confirmed::install_confirmed_replication_source;
+pub use confirmed::{ConfirmedInputHorizon, install_confirmed_replication_source};
 mod load;
 pub(crate) use load::{DivergenceQuery, rollback_would_change_state};
 
