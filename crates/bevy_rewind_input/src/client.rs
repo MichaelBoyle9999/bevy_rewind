@@ -55,10 +55,10 @@ impl<T: InputTrait, Tick: TickSource> Plugin for InputQueueClientPlugin<T, Tick>
 }
 
 fn store_inputs<T: InputTrait, Tick: TickSource>(
-    mut query: Query<(&mut InputHistory<T>, &mut T), With<InputAuthority>>,
+    mut query: Query<(&mut InputHistory<T>, &T), With<InputAuthority>>,
     tick: Res<Tick>,
 ) {
-    for (mut hist, mut input) in query.iter_mut() {
+    for (mut hist, input) in query.iter_mut() {
         match hist.updated_at().partial_cmp(&(*tick).into()).unwrap() {
             std::cmp::Ordering::Greater => {
                 hist.reset();
@@ -69,8 +69,16 @@ fn store_inputs<T: InputTrait, Tick: TickSource>(
             std::cmp::Ordering::Less => {}
         };
 
-        let taken = std::mem::take(&mut *input);
-        hist.write(*tick, taken);
+        // Clone, never `mem::take`: the live component is a *snapshot* the
+        // application's capture rewrites each tick, and some fields carry
+        // state across ticks (a wrapping press counter; a steer angle the
+        // capture slews from its previous value). Zeroing the live input here
+        // planted a phantom `T::default()` the tick after any field the
+        // capture only writes conditionally — e.g. a press counter reverting
+        // to 0 one tick after a press, which edge-detecting consumers saw as
+        // a second, spurious press. The server-side twin
+        // (`store_authority_inputs`) has always cloned.
+        hist.write(*tick, input.clone());
     }
 }
 
@@ -224,6 +232,12 @@ mod tests {
         // Entities with InputAuthority should have history written
         let e = app.world().entity(e1);
         assert_eq!(hist(5, [A(4)]), *e.get::<InputHistory<A>>().unwrap());
+        // ... and the live component must survive the store untouched: it is a
+        // snapshot the capture rewrites, and fields the capture only writes
+        // conditionally (press counters, slewed axes) carry their value across
+        // ticks. A `mem::take` here once reverted a press counter to default
+        // the tick after a press — a phantom edge downstream.
+        assert_eq!(A(4), *e.get::<A>().unwrap());
 
         // Entities without should not
         let e = app.world().entity(e2);
