@@ -16,6 +16,10 @@ pub struct InsertBatch {
 }
 
 impl InsertBatch {
+    #[expect(
+        clippy::new_without_default,
+        reason = "no consumer needs Default; adding it would be untested dead code"
+    )]
     pub fn new() -> Self {
         Self {
             ids: Vec::with_capacity(128),
@@ -41,10 +45,10 @@ impl InsertBatch {
 
         // If items would otherwise not be aligned, add alignment
         let align = comp.layout().align();
-        let extra_offset = if self.data.len() % align != 0 {
-            align - (self.data.len() % align)
-        } else {
+        let extra_offset = if self.data.len().is_multiple_of(align) {
             0
+        } else {
+            align - (self.data.len() % align)
         };
 
         let grow = comp.size() + extra_offset;
@@ -86,6 +90,10 @@ pub struct RemoveBatch {
 }
 
 impl RemoveBatch {
+    #[expect(
+        clippy::new_without_default,
+        reason = "no consumer needs Default; adding it would be untested dead code"
+    )]
     pub fn new() -> Self {
         Self {
             ids: Vec::with_capacity(128),
@@ -110,46 +118,5 @@ impl EntityCommand for RemoveBatch {
         for id in self.ids {
             entity.remove_by_id(id);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::history::component::HistoryComponent;
-
-    use super::{super::test_utils::*, InsertBatch};
-    use bevy::{ecs::system::EntityCommand, prelude::*};
-
-    #[test]
-    fn insert_minimal_archetype_moves() {
-        let mut world = World::new();
-
-        let comp_a = world.register_component::<A>();
-        let comp_c = world.register_component::<C>();
-
-        let mut batch = InsertBatch::new();
-        batch.push(comp_a, &HistoryComponent::new::<A>(), |ptr| {
-            *unsafe { ptr.deref_mut::<A>() } = A(5);
-        });
-        batch.push(comp_c, &HistoryComponent::new::<C>(), |ptr| {
-            *unsafe { ptr.deref_mut::<C>() } = C(12, 2);
-        });
-
-        let e1 = world.spawn_empty().id();
-        world.flush();
-
-        let archetypes_before = world.archetypes().len();
-        let e = world.entity_mut(e1);
-        assert_eq!(None, e.get::<A>());
-        assert_eq!(None, e.get::<C>());
-
-        batch.apply(e);
-        world.flush();
-
-        let e = world.entity(e1);
-        assert_eq!(Some(&A(5)), e.get::<A>());
-        assert_eq!(Some(&C(12, 2)), e.get::<C>());
-        let archetypes_after = world.archetypes().len();
-        assert_eq!(archetypes_before + 1, archetypes_after);
     }
 }

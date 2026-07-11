@@ -135,10 +135,7 @@ fn disable_unspawned_during_rollback(
 /// see them.
 fn reenable_at_spawn_tick<Tick: TickSource>(
     mut commands: Commands,
-    q: Query<
-        (Entity, &SpawnedAt),
-        (With<Unspawned>, Or<(With<Disabled>, Without<Disabled>)>),
-    >,
+    q: Query<(Entity, &SpawnedAt), (With<Unspawned>, Or<(With<Disabled>, Without<Disabled>)>)>,
     tick: Res<Tick>,
 ) {
     let cur: RepliconTick = (*tick).into();
@@ -209,7 +206,7 @@ impl<Reason: SpawnReason> Plugin for SpawnPlugin<Reason> {
         app.init_resource::<SpawnedEntities<Reason>>().add_systems(
             RollbackSchedule::BackToPresent,
             (
-                |world: &World| -> RepliconTick { world.resource::<GetTick>().0(world) }
+                (|world: &World| -> RepliconTick { world.resource::<GetTick>().0(world) })
                     .pipe(clean_spawned_entities_system::<Reason>),
                 reset_removals,
             )
@@ -353,7 +350,14 @@ impl EntityManagementCommands for Commands<'_, '_> {
         {
             if let Ok(mut entity_cmd) = self.get_entity(entity) {
                 entity_cmd.commands().queue(UpdateSpawnedEntity(reason));
-                entity_cmd.insert(bundle).remove::<(Despawned, Unspawned)>();
+                // Remove the lifecycle markers one at a time: bundle removal
+                // fires all `on_remove` hooks before removing anything, so a
+                // combined remove would leave `reenable` seeing the *other*
+                // marker still present both times and never drop `Disabled`.
+                entity_cmd
+                    .insert(bundle)
+                    .remove::<Despawned>()
+                    .remove::<Unspawned>();
                 return entity;
             }
             warn!("Failed to reuse {}, creating new entity", entity);
@@ -416,14 +420,21 @@ impl EntityManagementWorld for World {
             && self.entities().contains(entity)
         {
             let mut entity_mut = self.entity_mut(entity);
-            entity_mut.insert(bundle).remove::<(Despawned, Unspawned)>();
+            // Remove the lifecycle markers one at a time: bundle removal fires
+            // all `on_remove` hooks before removing anything, so a combined
+            // remove would leave `reenable` seeing the *other* marker still
+            // present both times and never drop `Disabled`.
+            entity_mut
+                .insert(bundle)
+                .remove::<Despawned>()
+                .remove::<Unspawned>();
             return entity_mut;
         }
 
         let new_entity = self.spawn((Reuse, bundle, Signature::from(&reason))).id();
         self.resource_mut::<SpawnedEntities<Reason>>()
             .insert(reason, tick, new_entity);
-        return self.entity_mut(new_entity);
+        self.entity_mut(new_entity)
     }
 
     fn register_reuse<Reason: SpawnReason>(&mut self, reason: Reason, entity: Entity) {
@@ -451,7 +462,6 @@ impl EntityManagementWorld for World {
         let mut entity_mut = self.entity_mut(entity);
         entity_mut.insert(Despawned);
         self.flush();
-        return;
     }
 }
 

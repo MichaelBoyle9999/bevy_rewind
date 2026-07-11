@@ -1,0 +1,9 @@
+# cargo-mutants configuration for the bevy_rewind_entity_management
+# crate. The justfile `mutants` recipe runs from this directory and
+# passes this file via `--config mutants.toml`, which replaces the
+# default workspace-root `.cargo/mutants.toml` discovery. Glob paths
+# are relative to the workspace tree root. File- and function-level
+# exclusions live in-source as `#[cfg_attr(test, mutants::skip)]`
+# attributes.
+
+examine_globs = ["bevy_rewind/crates/bevy_rewind_entity_management/src/**/*.rs"]

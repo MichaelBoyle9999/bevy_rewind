@@ -3,10 +3,20 @@ name = "bevy_rewind"
 version = "0.1.0"
 edition = "2024"
 
-[lints]
-workspace = true
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+# Bevy ECS queries are inherently complex and would fire this lint pervasively.
+type_complexity = "allow"
 
 [dependencies]
-bevy.workspace = true
-bevy_replicon = { workspace = true, features = ["client"] }
-serde.workspace = true
+bevy = { path = "../../../third_party/bevy", default-features = false, features = ["bevy_log"] }
+# `server` is required unconditionally: the confirmed-source hook
+# (history/confirmed.rs) consumes replicon's server-gated
+# ConfirmedLookup/ConfirmedReplicationSource on both host and client.
+bevy_replicon = { path = "../../../third_party/bevy_replicon", default-features = false, features = ["client", "server"] }
+serde = "1.0"
+
+[dev-dependencies]
+mutants = "0.0.3"

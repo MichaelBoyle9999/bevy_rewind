@@ -1,16 +1,15 @@
 //! A crate for generic rollback handling in bevy
 
-mod history;
+pub mod history;
+use history::RollbackRegistry;
 pub use history::{
-    AuthoritativeHistory, ConfirmedInputHorizon, ExistingOrUninit,
-    install_confirmed_replication_source,
+    AuthoritativeHistory, ConfirmedInputHorizon, install_confirmed_replication_source,
 };
-use history::{LoadFn, RollbackRegistry};
 
-mod predicted_resource;
+pub mod predicted_resource;
 pub use predicted_resource::ResourceHistory;
 
-mod load;
+pub mod load;
 use load::{load_and_clear_resource_prediction, reinsert_predicted_resource};
 
 use std::{fmt::Debug, marker::PhantomData};
@@ -19,7 +18,7 @@ use bevy::{
     app::RunFixedMainLoop,
     ecs::{
         component::Mutable, intern::Interned, lifecycle::HookContext, schedule::ScheduleLabel,
-        world::DeferredWorld,
+        system::SystemParam, world::DeferredWorld,
     },
     prelude::*,
 };
@@ -129,12 +128,14 @@ impl<Tick: TickSource> Plugin for RollbackPlugin<Tick> {
 
 /// The tick to load data from
 #[derive(Resource, Deref)]
-pub struct LoadFrom(RepliconTick);
+pub struct LoadFrom(pub RepliconTick);
 
+/// The tick state is currently being stored for
 #[derive(Resource, Clone, Copy, Deref)]
-pub(crate) struct StoreFor(RepliconTick);
+pub struct StoreFor(pub RepliconTick);
 
-fn set_store_tick<Tick: TickSource>(mut commands: Commands, tick: Option<Res<Tick>>) {
+/// Derive [`StoreFor`] from the tick source resource
+pub fn set_store_tick<Tick: TickSource>(mut commands: Commands, tick: Option<Res<Tick>>) {
     let Some(tick) = tick else {
         panic!(
             "Tick source ({}) is required but the resource is missing",
@@ -148,6 +149,16 @@ fn set_store_tick<Tick: TickSource>(mut commands: Commands, tick: Option<Res<Tic
 #[derive(Resource, Default, Deref, DerefMut)]
 pub struct RequestedRollback(i16);
 
+/// The read-only inputs of the state-divergence gate in
+/// [`calculate_rollback_target`]: the per-entity histories to compare, the
+/// component registry, and the global confirm channel.
+#[derive(SystemParam)]
+struct DivergenceGate<'w, 's> {
+    diverged: history::DivergenceQuery<'w, 's>,
+    registry: Res<'w, RollbackRegistry>,
+    global_confirm: Res<'w, ServerMutateTicks>,
+}
+
 fn calculate_rollback_target<Tick: TickSource>(
     mut individual_confirms: MessageReader<EntityReplicated>,
     mut global_confirms: MessageReader<MutateTickReceived>,
@@ -155,9 +166,7 @@ fn calculate_rollback_target<Tick: TickSource>(
     frames: ResMut<RollbackFrames>,
     mut rollback_target: ResMut<RollbackTarget>,
     mut requested_info: ResMut<RequestedRollback>,
-    diverged: history::DivergenceQuery,
-    registry: Res<RollbackRegistry>,
-    global_confirm: Res<ServerMutateTicks>,
+    gate: DivergenceGate,
 ) {
     let tick = (*tick).into();
 
@@ -171,7 +180,7 @@ fn calculate_rollback_target<Tick: TickSource>(
     // still coasts on the stale prediction until the *state* confirm catches up,
     // overshooting a remote body's direction change; with it, the client reconciles
     // on input arrival, as promptly as the server's own (ungated) eager path does.
-    // No-op on the server: its gate is already inert (`diverged.is_empty()`, no
+    // No-op on the server: its gate is already inert (`gate.diverged.is_empty()`, no
     // inbound `AuthoritativeHistory` for bodies it owns), so the added term changes
     // nothing there — only the client, whose gate is live, is freed.
     let eager_in = **rollback_target;
@@ -235,11 +244,11 @@ fn calculate_rollback_target<Tick: TickSource>(
     // there.
     if target.get() < tick.get()
         && eager_in.is_none()
-        && !diverged.is_empty()
+        && !gate.diverged.is_empty()
         && !history::rollback_would_change_state(
-            &diverged,
-            &registry,
-            &global_confirm,
+            &gate.diverged,
+            &gate.registry,
+            &gate.global_confirm,
             target,
             tick,
         )
@@ -339,241 +348,6 @@ fn trigger_rollback<Tick: TickSource>(world: &mut World) {
     *world.resource_mut::<Time>() = world.resource::<Time<Virtual>>().as_generic();
 }
 
-#[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use bevy::{
-        ecs::schedule::InternedScheduleLabel,
-        prelude::*,
-        state::app::StatesPlugin,
-        time::{TimePlugin, TimeUpdateStrategy},
-    };
-    use bevy_replicon::client::server_mutate_ticks::{MutateTickReceived, ServerMutateTicks};
-
-    use crate::*;
-
-    #[derive(Resource, Clone, Copy, Deref, DerefMut, PartialEq, Eq, Debug, Default)]
-    pub struct Tick(pub u32);
-
-    impl From<RepliconTick> for Tick {
-        fn from(value: RepliconTick) -> Self {
-            Self(value.get())
-        }
-    }
-
-    impl From<Tick> for RepliconTick {
-        fn from(value: Tick) -> Self {
-            RepliconTick::new(value.0)
-        }
-    }
-
-    #[derive(Resource, Deref, DerefMut, Default)]
-    struct Runs(Vec<Tick>);
-
-    #[derive(Resource, Deref, DerefMut, Default)]
-    struct Deltas(Vec<u32>);
-
-    #[derive(ScheduleLabel, Clone, PartialEq, Eq, Debug, Hash)]
-    struct NoTy;
-
-    fn init_app() -> App {
-        let mut app = App::new();
-        app.add_plugins((
-            StatesPlugin,
-            RepliconSharedPlugin::default(),
-            RollbackPlugin::<Tick> {
-                store_schedule: NoTy.intern(),
-                rollback_schedule: FixedUpdate.intern(),
-                phantom: PhantomData,
-            },
-            TimePlugin,
-        ))
-        .init_resource::<ServerMutateTicks>()
-        .add_message::<EntityReplicated>()
-        .add_message::<MutateTickReceived>()
-        .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
-            16,
-        )))
-        .insert_resource(Tick(15))
-        .init_resource::<Runs>()
-        .init_resource::<Deltas>();
-
-        app.add_systems(
-            FixedUpdate,
-            (
-                |mut runs: ResMut<Runs>, tick: Res<Tick>| runs.push(*tick),
-                |mut deltas: ResMut<Deltas>, time: Res<Time>| {
-                    deltas.push(time.delta().as_micros() as u32);
-                },
-            ),
-        );
-
-        // The first update doesn't advance time
-        app.update();
-
-        app
-    }
-
-    #[test]
-    fn rollback_order() {
-        let mut app = init_app();
-        assert_eq!(*app.world().resource::<Tick>(), Tick(15));
-
-        #[derive(Resource, Deref, DerefMut, Default)]
-        struct Schedules(Vec<InternedScheduleLabel>);
-
-        use RollbackSchedule::*;
-
-        app.add_systems(PreRollback, |mut schedules: ResMut<Schedules>| {
-            schedules.push(PreRollback.intern());
-        })
-        .add_systems(Rollback, |mut schedules: ResMut<Schedules>| {
-            schedules.push(Rollback.intern())
-        })
-        .add_systems(PostRollback, |mut schedules: ResMut<Schedules>| {
-            schedules.push(PostRollback.intern());
-        })
-        .add_systems(PreResimulation, |mut schedules: ResMut<Schedules>| {
-            schedules.push(PreResimulation.intern());
-        })
-        .add_systems(PostResimulation, |mut schedules: ResMut<Schedules>| {
-            schedules.push(PostResimulation.intern());
-        })
-        .add_systems(BackToPresent, |mut schedules: ResMut<Schedules>| {
-            schedules.push(BackToPresent.intern());
-        })
-        .add_systems(FixedUpdate, |mut schedules: ResMut<Schedules>| {
-            schedules.push(FixedUpdate.intern());
-        })
-        .init_resource::<Schedules>();
-
-        // Set a rollback target
-        **app.world_mut().resource_mut::<RollbackTarget>() = Some(Tick(14).into());
-        app.update();
-
-        // We ran 2 rollback frames, all the expected schedules should've ran in the right order
-        assert_eq!(
-            **app.world().resource::<Schedules>(),
-            [
-                // The rollback to tick 14
-                PreRollback.intern(),
-                Rollback.intern(),
-                PostRollback.intern(),
-                // Resimulation of tick 14
-                PreResimulation.intern(),
-                FixedUpdate.intern(),
-                PostResimulation.intern(),
-                // Resimulation of tick 15
-                PreResimulation.intern(),
-                FixedUpdate.intern(),
-                PostResimulation.intern(),
-                // Back to present
-                BackToPresent.intern(),
-                // The regular fixed update
-                FixedUpdate.intern()
-            ]
-        );
-    }
-
-    #[test]
-    fn rollback_uses_fixed_deltas() {
-        let mut app = init_app();
-        assert_eq!(*app.world().resource::<Tick>(), Tick(15));
-
-        app.update();
-
-        assert_eq!(
-            app.world().resource::<Time<()>>().delta().as_micros(),
-            16000
-        );
-        assert_eq!(**app.world().resource::<Runs>(), [Tick(15)]);
-        assert_eq!(**app.world().resource::<Deltas>(), [15625]);
-
-        // Set a rollback target
-        **app.world_mut().resource_mut::<RollbackTarget>() = Some(Tick(14).into());
-        app.update();
-
-        // We ran 2 rollback frames, all executed deltas should match Time<Fixed>, not Time<Virtual>
-        assert_eq!(
-            app.world().resource::<Time<()>>().delta().as_micros(),
-            16000
-        );
-        assert_eq!(
-            **app.world().resource::<Runs>(),
-            [Tick(15), Tick(14), Tick(15), Tick(15)]
-        );
-        assert_eq!(
-            **app.world().resource::<Deltas>(),
-            [15625, 15625, 15625, 15625]
-        );
-    }
-
-    #[test]
-    fn load_new_not_on_first_frame() {
-        let mut app = init_app();
-        assert_eq!(*app.world().resource::<Tick>(), Tick(15));
-
-        #[derive(Resource, Deref, DerefMut, Default)]
-        struct Loads(Vec<bool>);
-
-        app.add_systems(
-            RollbackSchedule::PreResimulation,
-            (
-                (|mut loads: ResMut<Loads>| {
-                    loads.push(false); // Append a false for the general one
-                }),
-                (|mut loads: ResMut<Loads>| {
-                    loads.push(true); // Append a true for the load set
-                })
-                .in_set(RollbackLoadSet),
-            )
-                .chain(),
-        )
-        .init_resource::<Loads>();
-
-        **app.world_mut().resource_mut::<RollbackTarget>() = Some(Tick(13).into());
-        app.update();
-
-        // We ran 3 rollback frames, we expect the general load to run each time, and the load set twice
-        assert_eq!(
-            **app.world().resource::<Loads>(),
-            [
-                false, // We expect only a single general load first
-                false, true, // Then both for the other frames
-                false, true,
-            ],
-        );
-    }
-
-    /// A future rollback target fast-forwards the local tick to the target and loads auth at
-    /// the latest confirmed tick. Future targets bypass `calculate_rollback_target`'s
-    /// divergence gate (there is no predicted state ahead of the local tick to compare
-    /// against), so just-arrived authoritative state stamped ahead of the local tick is still
-    /// applied. (This test drives the target resource directly, so it exercises the
-    /// fast-forward branch regardless of the gate.)
-    #[test]
-    fn fast_forward() {
-        let mut app = init_app();
-        assert_eq!(*app.world().resource::<Tick>(), Tick(15));
-
-        app.update();
-
-        assert_eq!(*app.world().resource::<Tick>(), Tick(15));
-        assert_eq!(**app.world().resource::<Runs>(), [Tick(15)]);
-        assert!(app.world().resource::<Time<Fixed>>().overstep_fraction() < 1.);
-
-        // Set rollback target to the future
-        **app.world_mut().resource_mut::<RollbackTarget>() = Some(Tick(20).into());
-        app.update();
-
-        // Because the target is in the future, we fast forward and only run the newest tick
-        assert_eq!(*app.world().resource::<Tick>(), Tick(20));
-        assert_eq!(**app.world().resource::<Runs>(), [Tick(15), Tick(20)]);
-        assert!(app.world().resource::<Time<Fixed>>().overstep_fraction() < 1.);
-    }
-}
-
 /// The schedule label for the schedule in which data is stored
 #[derive(Resource, Deref)]
 pub struct StoreScheduleLabel(Interned<dyn ScheduleLabel>);
@@ -607,26 +381,6 @@ pub trait RollbackApp {
     ) -> &mut Self;
     /// Register a predicted-only resource
     fn register_predicted_resource<T: Resource + Clone + Debug>(&mut self) -> &mut Self;
-
-    /// Register a predicted-only component with a custom load function
-    fn register_predicted_component_with_load<
-        T: Component<Mutability = Mutable> + Clone + Debug + PartialEq,
-    >(
-        &mut self,
-        load_fn: LoadFn<T>,
-    ) -> &mut Self;
-    /// Register an authoritative component with a custom load function
-    fn register_authoritative_component_with_load<
-        T: Component<Mutability = Mutable> + Clone + Debug + PartialEq,
-    >(
-        &mut self,
-        load_fn: LoadFn<T>,
-    ) -> &mut Self;
-    /// Register a predicted-only resource with a custom load function
-    fn register_predicted_resource_with_load<T: Resource + Clone + Debug + PartialEq>(
-        &mut self,
-        load_fn: LoadFn<T>,
-    ) -> &mut Self;
 }
 
 impl RollbackApp for App {
@@ -653,7 +407,7 @@ impl RollbackApp for App {
 
         self.set_marker_fns::<Predicted, T>(
             history::write_authoritative_history,
-            history::remove_authoritative_history::<T>,
+            history::remove_authoritative_history,
         )
     }
     fn register_authoritative_component_with_tolerance<
@@ -671,7 +425,7 @@ impl RollbackApp for App {
 
         self.set_marker_fns::<Predicted, T>(
             history::write_authoritative_history,
-            history::remove_authoritative_history::<T>,
+            history::remove_authoritative_history,
         )
     }
     fn register_predicted_resource<T: Resource + Clone + Debug>(&mut self) -> &mut Self {
@@ -690,54 +444,6 @@ impl RollbackApp for App {
         .add_systems(
             RollbackSchedule::PreResimulation,
             reinsert_predicted_resource::<T>.in_set(RollbackLoadSet),
-        )
-        .add_systems(
-            store_schedule,
-            predicted_resource::append_history::<T>.in_set(RollbackStoreSet),
-        )
-    }
-
-    fn register_predicted_component_with_load<
-        T: Component<Mutability = Mutable> + Clone + Debug + PartialEq,
-    >(
-        &mut self,
-        load_fn: LoadFn<T>,
-    ) -> &mut Self {
-        // Register component to rollback component registry
-        let mut registry = self
-            .world_mut()
-            .remove_resource::<RollbackRegistry>()
-            .unwrap();
-        registry.register_with_load::<T>(self.world_mut(), load_fn);
-        self.world_mut().insert_resource(registry);
-        self
-    }
-
-    fn register_authoritative_component_with_load<
-        T: Component<Mutability = Mutable> + Clone + Debug + PartialEq,
-    >(
-        &mut self,
-        load_fn: LoadFn<T>,
-    ) -> &mut Self {
-        self.register_predicted_component_with_load::<T>(load_fn);
-
-        self.set_marker_fns::<Predicted, T>(
-            history::write_authoritative_history,
-            history::remove_authoritative_history::<T>,
-        )
-    }
-
-    fn register_predicted_resource_with_load<T: Resource + Clone + Debug + PartialEq>(
-        &mut self,
-        _: LoadFn<T>,
-    ) -> &mut Self {
-        self.world_mut().init_resource::<ResourceHistory<T>>();
-
-        // Register store systems
-        let store_schedule = **self.world().resource::<StoreScheduleLabel>();
-        self.add_systems(
-            RollbackSchedule::PreRollback,
-            predicted_resource::save_initial::<T>.in_set(RollbackStoreSet),
         )
         .add_systems(
             store_schedule,
@@ -793,7 +499,8 @@ pub enum RollbackSchedule {
 /// compile-time canary against it; see `game/src/networking/components.rs`.
 pub const DEFAULT_ROLLBACK_FRAMES: u8 = 15;
 
-/// In-test default for [`RollbackFrames`], smaller to keep unit-test histories tight.
+/// In-test value for [`RollbackFrames`], smaller to keep unit-test histories tight.
+/// Tests insert `RollbackFrames::new(TEST_ROLLBACK_FRAMES)` explicitly.
 pub const TEST_ROLLBACK_FRAMES: u8 = 5;
 
 /// A resource specifying the maximum number of rollback frames that should be stored.
@@ -804,10 +511,7 @@ pub struct RollbackFrames(u8);
 
 impl Default for RollbackFrames {
     fn default() -> Self {
-        #[cfg(test)]
-        return RollbackFrames(TEST_ROLLBACK_FRAMES);
-        #[cfg(not(test))]
-        return RollbackFrames(DEFAULT_ROLLBACK_FRAMES);
+        RollbackFrames(DEFAULT_ROLLBACK_FRAMES)
     }
 }
 

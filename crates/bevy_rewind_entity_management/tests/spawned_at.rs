@@ -3,77 +3,24 @@
 //! adding `Predicted` to an entity stamps the current tick, and that adds during
 //! a resim do not overwrite a prior stamp.
 
-use std::{marker::PhantomData, time::Duration};
+#[path = "support/app.rs"]
+mod app;
+#[path = "support/tick.rs"]
+mod tick;
 
-use bevy::{
-    ecs::{entity_disabling::Disabled, schedule::ScheduleLabel},
-    prelude::*,
-    state::app::StatesPlugin,
-    time::{TimePlugin, TimeUpdateStrategy},
-};
-use bevy_replicon::{
-    client::server_mutate_ticks::{MutateTickReceived, ServerMutateTicks},
-    prelude::*,
-    shared::replicon_tick::RepliconTick,
-};
-use bevy_rewind::{Predicted, Resimulating, RollbackPlugin, RollbackSchedule, RollbackTarget};
-use bevy_rewind_entity_management::{EntityManagementPlugin, SpawnedAt, Unspawned};
+use app::init_app;
+use tick::TestTick;
+
+use bevy::{ecs::entity_disabling::Disabled, prelude::*};
+use bevy_replicon::shared::replicon_tick::RepliconTick;
+use bevy_rewind::{Predicted, Resimulating, RollbackSchedule, RollbackTarget};
+use bevy_rewind_entity_management::{SpawnedAt, Unspawned};
 
 /// Probe captured by an in-rollback system so the test can observe state that
 /// only exists transiently inside the rollback machinery (e.g. an entity
 /// `Unspawned` for ticks `T_target..S` before resim crosses its spawn tick).
 #[derive(Resource, Default, Debug)]
 struct UnspawnedAtPostRollback(Vec<Entity>);
-
-#[derive(Resource, Clone, Copy, Deref, DerefMut, PartialEq, Eq, Debug, Default)]
-struct TestTick(u32);
-
-impl From<RepliconTick> for TestTick {
-    fn from(v: RepliconTick) -> Self {
-        Self(v.get())
-    }
-}
-
-impl From<TestTick> for RepliconTick {
-    fn from(v: TestTick) -> Self {
-        RepliconTick::new(v.0)
-    }
-}
-
-#[derive(ScheduleLabel, Clone, PartialEq, Eq, Debug, Hash)]
-struct NoTy;
-
-fn init_app(start_tick: u32) -> App {
-    let mut app = App::new();
-    app.add_plugins((
-        StatesPlugin,
-        RepliconSharedPlugin::default(),
-        RollbackPlugin::<TestTick> {
-            store_schedule: NoTy.intern(),
-            rollback_schedule: FixedUpdate.intern(),
-            phantom: PhantomData,
-        },
-        EntityManagementPlugin::<TestTick>::new(),
-        TimePlugin,
-    ))
-    .init_resource::<ServerMutateTicks>()
-    .add_message::<bevy_replicon::client::confirm_history::EntityReplicated>()
-    .add_message::<MutateTickReceived>()
-    .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
-        16,
-    )))
-    .insert_resource(TestTick(start_tick));
-
-    // `RollbackPlugin` runs its simulation schedule (FixedUpdate here) via
-    // `run_schedule`, which panics if the schedule was never registered. Calling
-    // `add_systems` would init it lazily, but the tests don't need any FixedUpdate
-    // systems — so init the empty schedule directly.
-    app.init_schedule(FixedUpdate);
-
-    // First update doesn't advance time; pump once so plugin init settles.
-    app.update();
-    app
-}
 
 #[test]
 fn spawned_at_stamped_on_predicted_add() {
@@ -103,6 +50,25 @@ fn spawned_at_skipped_during_resim() {
     assert!(
         app.world().entity(e).get::<SpawnedAt>().is_none(),
         "SpawnedAt should not be stamped while Resimulating is present"
+    );
+}
+
+#[test]
+fn preexisting_spawned_at_is_not_overwritten() {
+    // An entity that already carries a SpawnedAt when Predicted is added (e.g.
+    // a replicated stamp) must keep the original tick.
+    let mut app = init_app(10);
+
+    let e = app
+        .world_mut()
+        .spawn((SpawnedAt(RepliconTick::new(3)), Predicted))
+        .id();
+    app.update();
+
+    assert_eq!(
+        app.world().entity(e).get::<SpawnedAt>().copied(),
+        Some(SpawnedAt(RepliconTick::new(3))),
+        "a pre-existing SpawnedAt must not be overwritten by the observer"
     );
 }
 

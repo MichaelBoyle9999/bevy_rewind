@@ -16,9 +16,9 @@ pub struct EntityHistory {
 }
 
 pub struct ComponentHistory {
-    removed_mask: u64,
-    list: SparseBlobDeque,
-    last_tick: u32,
+    pub removed_mask: u64,
+    pub list: SparseBlobDeque,
+    pub last_tick: u32,
 }
 
 impl core::fmt::Debug for ComponentHistory {
@@ -86,17 +86,6 @@ impl<T: Clone> TickData<&T> {
     }
 }
 
-impl<T: Copy> TickData<&T> {
-    pub fn copied(&self) -> TickData<T> {
-        use TickData::*;
-        match *self {
-            Value(&t) => Value(t),
-            Removed => Removed,
-            Missing => Missing,
-        }
-    }
-}
-
 impl<T> TickData<T> {
     pub fn map<O>(&self, f: impl Fn(&T) -> O) -> TickData<O> {
         match self {
@@ -108,7 +97,7 @@ impl<T> TickData<T> {
 }
 
 impl ComponentHistory {
-    pub(crate) fn from_component(component: &HistoryComponent, size: NonZero<u8>) -> Self {
+    pub fn from_component(component: &HistoryComponent, size: NonZero<u8>) -> Self {
         Self {
             removed_mask: 0,
             list: SparseBlobDeque::from_component(component, size),
@@ -116,7 +105,7 @@ impl ComponentHistory {
         }
     }
 
-    pub(crate) fn from_type<T: Clone + PartialEq>(size: NonZero<u8>) -> Self {
+    pub fn from_type<T: Clone + PartialEq>(size: NonZero<u8>) -> Self {
         Self {
             removed_mask: 0,
             list: SparseBlobDeque::from_type::<T>(size),
@@ -124,18 +113,16 @@ impl ComponentHistory {
         }
     }
 
+    #[expect(
+        clippy::len_without_is_empty,
+        reason = "no consumer needs is_empty; adding it would be untested dead code"
+    )]
     pub fn len(&self) -> usize {
         self.list.len()
     }
 
-    #[cfg(test)]
     pub fn stored_items(&self) -> usize {
         self.list.stored_items()
-    }
-
-    #[cfg(test)]
-    pub fn set_last_tick(&mut self, last_tick: u32) {
-        self.last_tick = last_tick;
     }
 
     pub fn first_tick(&self) -> u32 {
@@ -184,10 +171,12 @@ impl ComponentHistory {
 
         let index = self.len() - 1 - item_ago as usize;
 
-        match self.list.get(index) {
-            Some(ptr) => TickData::Value(ptr),
-            None => TickData::Missing,
-        }
+        // SAFETY: reaching here means `item_ago <= len` (otherwise the
+        // `removed_ago > len && item_ago > len` guard above returned `Missing`,
+        // and `removed_ago <= item_ago` returned `Removed`), so `item_ago` is the
+        // `trailing_zeros` of a genuinely set bit in `self.list.mask()`. Slot
+        // `index` is therefore occupied and `get` cannot return `None`.
+        TickData::Value(unsafe { self.list.get(index).unwrap_unchecked() })
     }
 
     // Get the number of empty items after the specified tick
@@ -199,18 +188,38 @@ impl ComponentHistory {
             return 64;
         }
 
+        // The history's capacity is at most 64 (see `SparseBlobDeque::new`), so
+        // `ago` — clamped to `len - 1` — is always at most 63.
         let ago = ((self.last_tick - tick) as usize).min(self.len().saturating_sub(1));
-        let search_mask = if ago >= 64 {
-            u64::MAX
-        } else {
-            (1 << (ago as u64)) - 1
-        };
+        let search_mask = (1 << (ago as u64)) - 1;
 
         let empty = (self.list.mask() | self.removed_mask) & search_mask;
         empty.leading_zeros() - (64u32.saturating_sub(ago as u32))
     }
 
+    /// Write a value for `tick`, filling any gap since the last written tick
+    ///
+    /// # Safety
+    /// - The value written in `write_fn` MUST match the type this history was made for
+    /// - `write_fn` MUST write to the [`PtrMut`], or the value will be uninitialized
     pub unsafe fn write(&mut self, tick: u32, write_fn: impl FnOnce(PtrMut)) {
+        // Delegate immediately to the non-generic `write_dyn` so all the branch
+        // logic lives in a single instantiation (this generic wrapper is
+        // branch-free).
+        let mut write_fn = Some(write_fn);
+        // SAFETY: `write_dyn` invokes the closure at most once (it calls exactly
+        // one of `replace`/`append`, each of which runs the closure at most once),
+        // so `take()` always yields `Some` here — no second call can observe `None`.
+        unsafe { self.write_dyn(tick, &mut |ptr| (write_fn.take().unwrap_unchecked())(ptr)) }
+    }
+
+    /// The branch-bearing body of [`write`](Self::write), kept non-generic so its
+    /// branches are counted once rather than once per `write_fn` type.
+    ///
+    /// # Safety
+    /// Same contract as [`write`](Self::write): `write_fn` must write a value of
+    /// this history's type to the [`PtrMut`].
+    unsafe fn write_dyn(&mut self, tick: u32, write_fn: &mut dyn FnMut(PtrMut)) {
         self.fill_gaps(tick);
 
         if !self.list.is_empty() && tick <= self.last_tick {
@@ -223,7 +232,7 @@ impl ComponentHistory {
             }
 
             let index = self.len() - 1 - ago;
-            unsafe { self.list.replace(index, write_fn) };
+            unsafe { self.list.replace(index, &mut *write_fn) };
             return;
         }
 
@@ -232,7 +241,7 @@ impl ComponentHistory {
         }
 
         self.removed_mask = self.removed_mask.wrapping_shl(1);
-        unsafe { self.list.append(Some(write_fn)) }
+        unsafe { self.list.append(Some(&mut *write_fn)) }
         self.last_tick = tick;
     }
 
@@ -378,329 +387,5 @@ impl ComponentHistory {
         let zeros = self.list.mask().leading_zeros();
         let ago = 63 - zeros;
         self.clean(self.last_tick.saturating_sub(ago));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use bevy::ptr::PtrMut;
-
-    use super::{super::test_utils::*, ComponentHistory, TickData::*};
-    use crate::history::component::HistoryComponent;
-
-    use std::num::NonZero;
-
-    #[test]
-    fn append() {
-        let a = HistoryComponent::new::<A>();
-        let mut history = ComponentHistory::from_component(&a, NonZero::new(5).unwrap());
-        assert_eq!(0, history.len());
-
-        unsafe { history.write(0, |ptr| *ptr.deref_mut() = A(1)) };
-        assert_eq!(1, history.len());
-        unsafe { history.write(1, |ptr| *ptr.deref_mut() = A(2)) };
-        assert_eq!(2, history.len());
-        unsafe { history.write(2, |ptr| *ptr.deref_mut() = A(3)) };
-        assert_eq!(3, history.len());
-
-        assert_eq!(Value(&A(1)), history.get(0).deref());
-        assert_eq!(Value(&A(2)), history.get(1).deref());
-        assert_eq!(Value(&A(3)), history.get(2).deref());
-        assert_eq!(Missing, history.get(3).deref::<A>());
-    }
-
-    #[test]
-    fn get_latest() {
-        let a = HistoryComponent::new::<A>();
-        let mut history = ComponentHistory::from_component(&a, NonZero::new(5).unwrap());
-        assert_eq!(0, history.len());
-
-        unsafe { history.write(0, |ptr| *ptr.deref_mut() = A(1)) };
-        unsafe { history.write(4, |ptr| *ptr.deref_mut() = A(2)) };
-        assert_eq!(5, history.len());
-
-        for i in 0..=3 {
-            assert_eq!(Value(&A(1)), history.get_latest(i).deref());
-        }
-
-        history.mark_removed(1);
-        for i in 1..=3 {
-            assert_eq!(Removed, history.get_latest(i).deref::<A>());
-        }
-    }
-
-    #[test]
-    fn start_non_zero_tick() {
-        let a = HistoryComponent::new::<A>();
-        let mut history = ComponentHistory::from_component(&a, NonZero::new(5).unwrap());
-        assert_eq!(0, history.len());
-
-        unsafe { history.write(25, |ptr| *ptr.deref_mut() = A(1)) };
-        assert_eq!(1, history.len());
-        assert_eq!(25, history.last_tick);
-
-        assert_eq!(Missing, history.get(24).deref::<A>());
-        assert_eq!(Value(&A(1)), history.get(25).deref::<A>());
-        assert_eq!(Missing, history.get(26).deref::<A>());
-    }
-
-    #[test]
-    fn repeated_tick() {
-        let a = HistoryComponent::new::<A>();
-        let mut history = ComponentHistory::from_component(&a, NonZero::new(5).unwrap());
-        assert_eq!(0, history.len());
-
-        // Write some initial data
-        unsafe { history.write(0, |ptr| *ptr.deref_mut() = A(1)) };
-        unsafe { history.write(1, |ptr| *ptr.deref_mut() = A(2)) };
-        assert_eq!(2, history.len());
-
-        // Write to ticks already written
-        unsafe { history.write(1, |ptr| *ptr.deref_mut() = A(4)) };
-        assert_eq!(2, history.len());
-        unsafe { history.write(0, |ptr| *ptr.deref_mut() = A(3)) };
-        assert_eq!(2, history.len());
-
-        assert_eq!(Value(&A(3)), history.get(0).deref());
-        assert_eq!(Value(&A(4)), history.get(1).deref());
-        assert_eq!(Missing, history.get(2).deref::<A>());
-    }
-
-    #[test]
-    fn gaps() {
-        let a = HistoryComponent::new::<A>();
-        let mut history = ComponentHistory::from_component(&a, NonZero::new(5).unwrap());
-        assert_eq!(0, history.len());
-
-        unsafe { history.write(0, |ptr| *ptr.deref_mut() = A(1)) };
-        // Tick 1 is never written
-        unsafe { history.write(2, |ptr| *ptr.deref_mut() = A(2)) };
-
-        assert_eq!(3, history.len());
-        assert_eq!(2, history.stored_items());
-
-        assert_eq!(Value(&A(1)), history.get(0).deref());
-        assert_eq!(Missing, history.get(1).deref::<A>());
-        assert_eq!(Value(&A(2)), history.get(2).deref());
-        assert_eq!(Missing, history.get(3).deref::<A>());
-    }
-
-    #[test]
-    fn wrap_retains_first_value() {
-        let a = HistoryComponent::new::<A>();
-        let mut history = ComponentHistory::from_component(&a, NonZero::new(5).unwrap());
-        assert_eq!(0, history.len());
-
-        unsafe { history.write(0, |ptr| *ptr.deref_mut() = A(1)) };
-        // Tick 1-3 are never written
-        unsafe { history.write(4, |ptr| *ptr.deref_mut() = A(2)) };
-        // Tick 5 is never written
-        unsafe { history.write(6, |ptr| *ptr.deref_mut() = A(3)) };
-
-        assert_eq!(5, history.len());
-        assert_eq!(3, history.stored_items());
-        // The first item was moved to tick 2 to retain a valid value
-        assert_eq!(Value(&A(1)), history.get(2).deref());
-        assert_eq!(Value(&A(2)), history.get(4).deref());
-        assert_eq!(Value(&A(3)), history.get(6).deref());
-        for i in [1, 3, 5] {
-            assert_eq!(Missing, history.get(i).deref::<A>());
-        }
-    }
-
-    #[test]
-    fn wrap_with_removed() {
-        let a = HistoryComponent::new::<A>();
-        let mut history = ComponentHistory::from_component(&a, NonZero::new(5).unwrap());
-        assert_eq!(0, history.len());
-
-        history.mark_removed(0);
-        // Tick 1-4 are never written
-        unsafe { history.write(5, |ptr| *ptr.deref_mut() = A(1)) };
-
-        assert_eq!(5, history.len());
-        assert_eq!(1, history.stored_items());
-        // The Removed was moved to tick 2 to retain a valid value
-        assert_eq!(Removed, history.get(1).deref::<A>());
-        assert_eq!(Value(&A(1)), history.get(5).deref());
-        for i in [0, 2, 3, 4, 6] {
-            assert_eq!(Missing, history.get(i).deref::<A>());
-        }
-    }
-
-    #[test]
-    fn wrap_more_than_capacity() {
-        let a = HistoryComponent::new::<A>();
-        let mut history = ComponentHistory::from_component(&a, NonZero::new(20).unwrap());
-        assert_eq!(0, history.len());
-
-        history.mark_removed(0);
-        // Tick 1-80 are never written
-        unsafe { history.write(81, |ptr| *ptr.deref_mut() = A(1)) };
-
-        assert_eq!(20, history.len());
-        assert_eq!(1, history.stored_items());
-        // The Removed was moved to tick 62 to retain a valid value in the gap
-        assert_eq!(Removed, history.get(62).deref::<A>());
-        assert_eq!(Value(&A(1)), history.get(81).deref());
-
-        // Tick 82-119 are never written
-        history.mark_removed(120);
-        // The value was moved to tick 101 to retain a valid value in the gap
-        assert_eq!(Value(&A(1)), history.get(101).deref());
-        assert_eq!(Removed, history.get(120).deref::<A>());
-    }
-
-    #[test]
-    fn out_of_order() {
-        let a = HistoryComponent::new::<A>();
-        let mut history = ComponentHistory::from_component(&a, NonZero::new(5).unwrap());
-        assert_eq!(0, history.len());
-
-        // Data is written out of order
-        unsafe { history.write(2, |ptr| *ptr.deref_mut() = A(3)) };
-        unsafe { history.write(1, |ptr| *ptr.deref_mut() = A(2)) };
-        unsafe { history.write(3, |ptr| *ptr.deref_mut() = A(4)) };
-        unsafe { history.write(0, |ptr| *ptr.deref_mut() = A(1)) };
-        assert_eq!(4, history.len());
-
-        assert_eq!(Value(&A(1)), history.get(0).deref());
-        assert_eq!(Value(&A(2)), history.get(1).deref());
-        assert_eq!(Value(&A(3)), history.get(2).deref());
-        assert_eq!(Value(&A(4)), history.get(3).deref());
-        assert_eq!(Missing, history.get(4).deref::<A>());
-    }
-
-    #[test]
-    fn clean() {
-        let a = HistoryComponent::new::<A>();
-        let mut history = ComponentHistory::from_component(&a, NonZero::new(5).unwrap());
-
-        unsafe { history.write(0, |ptr| *ptr.deref_mut() = A(1)) };
-        history.mark_removed(2);
-        unsafe { history.write(3, |ptr| *ptr.deref_mut() = A(2)) };
-        assert_eq!(4, history.len());
-        assert_eq!(2, history.stored_items());
-
-        // Target the last tick, this shouldn't do anything
-        history.clean(3);
-        assert_eq!(4, history.len());
-        assert_eq!(2, history.stored_items());
-
-        // Target tick 2, which should only remove data for ticks after it
-        history.clean(2);
-        assert_eq!(3, history.len());
-        assert_eq!(1, history.stored_items());
-
-        assert_eq!(Value(&A(1)), history.get(0).deref());
-        assert_eq!(Missing, history.get(1).deref::<A>());
-        assert_eq!(Removed, history.get(2).deref::<A>());
-        assert_eq!(Missing, history.get(3).deref::<A>());
-
-        // Cleaning should also remove gaps and removed
-        history.clean(0);
-        assert_eq!(1, history.len());
-        assert_eq!(1, history.stored_items());
-        assert_eq!(0, history.removed_mask);
-
-        assert_eq!(Value(&A(1)), history.get(0).deref());
-        for i in 1..=3 {
-            assert_eq!(Missing, history.get(i).deref::<A>());
-        }
-
-        for i in 5..=9 {
-            unsafe { history.write(i, |ptr| *ptr.deref_mut() = A(i as u16)) };
-        }
-        assert_eq!(5, history.len());
-        assert_eq!(5, history.stored_items());
-
-        // Target a tick before all items
-        history.clean(4);
-        assert_eq!(0, history.len());
-        assert_eq!(0, history.stored_items());
-    }
-
-    #[test]
-    fn keep_first_item() {
-        let a = HistoryComponent::new::<A>();
-        let mut history = ComponentHistory::from_component(&a, NonZero::new(5).unwrap());
-
-        unsafe { history.list.append(None::<fn(PtrMut)>) };
-        assert_eq!(1, history.len());
-
-        // Calling keep_first_item on a history with only Missing should do nothing
-        history.keep_first_item();
-        assert_eq!(1, history.len());
-
-        history.mark_removed(1);
-        assert_eq!(2, history.len());
-
-        // Calling keep_first_item on a history with only Missing and Removed should do nothing
-        history.keep_first_item();
-        assert_eq!(2, history.len());
-
-        unsafe { history.write(2, |ptr| *ptr.deref_mut() = A(1)) };
-        history.mark_removed(3);
-        unsafe { history.write(4, |ptr| *ptr.deref_mut() = A(2)) };
-        assert_eq!(5, history.len());
-
-        // Calling keep_first_item on a history with multiple items should keep only the first one
-        history.keep_first_item();
-        assert_eq!(3, history.len());
-
-        assert_eq!(Missing, history.get(0).deref::<A>());
-        assert_eq!(Removed, history.get(1).deref::<A>());
-        assert_eq!(Value(&A(1)), history.get(2).deref());
-    }
-
-    #[test]
-    fn empty_after() {
-        let a = HistoryComponent::new::<A>();
-        let mut history = ComponentHistory::from_component(&a, NonZero::new(64).unwrap());
-        assert_eq!(0, history.len());
-        assert_eq!(0, history.empty_after(0));
-
-        // Start with a None at index 0
-        unsafe { history.list.append(None::<fn(PtrMut)>) };
-        // Ticks at or after the end are always considered to have an arbitrary number of trailing empties
-        assert_eq!(64, history.empty_after(0));
-        assert_eq!(64, history.empty_after(1));
-
-        unsafe { history.write(3, |ptr| *ptr.deref_mut() = A(1)) };
-        assert_eq!(2, history.empty_after(0));
-        assert_eq!(1, history.empty_after(1));
-        assert_eq!(0, history.empty_after(2));
-        for i in 3..=4 {
-            assert_eq!(64, history.empty_after(i));
-        }
-
-        unsafe { history.write(20, |ptr| *ptr.deref_mut() = A(2)) };
-        assert_eq!(1, history.empty_after(1));
-        assert_eq!(16, history.empty_after(3));
-        assert_eq!(1, history.empty_after(18));
-        assert_eq!(0, history.empty_after(19));
-        for i in 20..=21 {
-            assert_eq!(64, history.empty_after(i));
-        }
-
-        history.mark_removed(25);
-        assert_eq!(3, history.empty_after(21));
-        assert_eq!(1, history.empty_after(23));
-        assert_eq!(0, history.empty_after(24));
-        for i in 25..=26 {
-            assert_eq!(64, history.empty_after(i));
-        }
-
-        unsafe { history.write(64, |ptr| *ptr.deref_mut() = A(3)) };
-        assert_eq!(37, history.empty_after(26));
-        assert_eq!(1, history.empty_after(62));
-        assert_eq!(0, history.empty_after(63));
-        for i in 64..=65 {
-            assert_eq!(64, history.empty_after(i));
-        }
-
-        // Index 0 has wrapped, and should count from the start which is now tick 1
-        assert_eq!(1, history.empty_after(0));
-        assert_eq!(1, history.empty_after(1));
     }
 }

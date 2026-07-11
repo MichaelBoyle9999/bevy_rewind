@@ -1,26 +1,22 @@
 // Data types
-mod blob_deque;
-mod sparse_blob_deque;
+pub mod blob_deque;
+pub mod sparse_blob_deque;
 
 // Shared history types
-mod component;
-pub use component::{ExistingOrUninit, LoadFn};
-mod component_history;
+pub mod component;
+pub mod component_history;
 
 // Specific history types
-mod authoritative;
+pub mod authoritative;
 pub use authoritative::AuthoritativeHistory;
-mod predicted;
+pub mod predicted;
 pub use predicted::PredictedHistory;
 
-mod batch;
-mod confirmed;
+pub mod batch;
+pub mod confirmed;
 pub use confirmed::{ConfirmedInputHorizon, install_confirmed_replication_source};
-mod load;
+pub mod load;
 pub(crate) use load::{DivergenceQuery, rollback_would_change_state};
-
-#[cfg(test)]
-mod test_utils;
 
 use bevy::{ecs::component::ComponentId, platform::collections::HashMap, prelude::*};
 use component::HistoryComponent;
@@ -39,7 +35,6 @@ impl Plugin for HistoryPlugin {
     }
 }
 
-#[allow(unused)]
 pub(crate) use authoritative::{remove_authoritative_history, write_authoritative_history};
 
 #[derive(Resource, Default)]
@@ -53,17 +48,6 @@ impl RollbackRegistry {
         let id = world.register_component::<T>();
         self.ids.insert(id, self.components.len());
         self.components.push(HistoryComponent::new::<T>());
-    }
-
-    pub fn register_with_load<T: Component + Clone + PartialEq>(
-        &mut self,
-        world: &mut World,
-        load_fn: LoadFn<T>,
-    ) {
-        let id = world.register_component::<T>();
-        self.ids.insert(id, self.components.len());
-        self.components
-            .push(HistoryComponent::with_load::<T>(load_fn));
     }
 
     /// Register a component whose divergence gate uses `tolerance` instead of

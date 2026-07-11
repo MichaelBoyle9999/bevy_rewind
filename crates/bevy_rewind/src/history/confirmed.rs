@@ -74,7 +74,7 @@ pub fn install_confirmed_replication_source(app: &mut App) {
 /// contract: read-only world access; any returned `Ptr` borrows the entity's
 /// history blob (valid for `'w`) and points to a value of `component`'s type
 /// (the rollback history stores values by their real component type).
-unsafe fn confirmed_lookup<'w>(
+pub unsafe fn confirmed_lookup<'w>(
     world: UnsafeWorldCell<'w>,
     entity: Entity,
     component: ComponentId,

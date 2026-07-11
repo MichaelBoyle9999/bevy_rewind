@@ -37,7 +37,7 @@ pub struct PredictedHistory {
     last_archetype: Option<ArchetypeId>,
 }
 
-fn run_store(world: &mut World) {
+pub fn run_store(world: &mut World) {
     // TODO: Check rollback frames, if it changed and went up, grow histories first
 
     world.resource_scope::<ArchetypeCache, _>(|world, mut cache| {
@@ -66,7 +66,7 @@ fn save_initial(world: &mut World) {
 }
 
 #[derive(Resource, Deref, DerefMut)]
-struct ArchetypeCache {
+pub struct ArchetypeCache {
     generation: ArchetypeGeneration,
     #[deref]
     list: Vec<ArchetypeEntry>,
@@ -83,7 +83,7 @@ impl Default for ArchetypeCache {
     }
 }
 
-struct ArchetypeEntry {
+pub struct ArchetypeEntry {
     id: ArchetypeId,
     predicted: Vec<(ComponentId, usize)>,
 }
@@ -152,10 +152,10 @@ fn store_components(
             .map(|e| e.id())
         {
             let entity_mut = world.get_entity(entity).unwrap();
-            // SAFETY: We don't do structural changes in this system
-            let Some(mut history) = (unsafe { entity_mut.get_mut::<PredictedHistory>() }) else {
-                continue;
-            };
+            // SAFETY: We don't do structural changes in this system. The cache
+            // only lists archetypes containing `PredictedHistory`, so every
+            // entity in them has one.
+            let mut history = unsafe { entity_mut.get_mut::<PredictedHistory>() }.unwrap();
 
             if history.last_archetype.is_some() {
                 for comp_hist in history.values_mut() {
@@ -179,22 +179,22 @@ fn store_components(
             .map(|e| e.id())
         {
             let entity = world.get_entity(entity).unwrap();
-            // SAFETY: We don't do structural changes in this system
-            let Some(mut history) = (unsafe { entity.get_mut::<PredictedHistory>() }) else {
-                continue;
-            };
+            // SAFETY: We don't do structural changes in this system. The cache
+            // only lists archetypes containing `PredictedHistory`, so every
+            // entity in them has one.
+            let mut history = unsafe { entity.get_mut::<PredictedHistory>() }.unwrap();
 
-            if let Some(last_archetype) = history.last_archetype {
-                if last_archetype != entry.id {
-                    // Archetype changed, check for components that should be marked removed
-                    for (component_id, comp_hist) in history.iter_mut() {
-                        if comp_hist.first_tick() >= tick {
-                            // Don't write Removed histories that haven't started yet
-                            continue;
-                        }
-                        if !entry.predicted.iter().any(|(id, _)| id == component_id) {
-                            comp_hist.mark_removed(tick);
-                        }
+            if let Some(last_archetype) = history.last_archetype
+                && last_archetype != entry.id
+            {
+                // Archetype changed, check for components that should be marked removed
+                for (component_id, comp_hist) in history.iter_mut() {
+                    if comp_hist.first_tick() >= tick {
+                        // Don't write Removed histories that haven't started yet
+                        continue;
+                    }
+                    if !entry.predicted.iter().any(|(id, _)| id == component_id) {
+                        comp_hist.mark_removed(tick);
                     }
                 }
             }
@@ -256,16 +256,14 @@ fn store_initial(
             .map(|e| e.id())
         {
             let entity = world.as_unsafe_world_cell().get_entity(entity).unwrap();
-            // SAFETY: We don't do structural changes in this system
-            let Some(mut history) = (unsafe { entity.get_mut::<PredictedHistory>() }) else {
-                continue;
-            };
+            // SAFETY: We don't do structural changes in this system. The cache
+            // only lists archetypes containing `PredictedHistory`, so every
+            // entity in them has one.
+            let mut history = unsafe { entity.get_mut::<PredictedHistory>() }.unwrap();
 
-            if let Some(last_archetype) = history.last_archetype {
-                if last_archetype == entry.id {
-                    // The archetype hasn't changed so there cannot be any new components
-                    continue;
-                }
+            if history.last_archetype == Some(entry.id) {
+                // The archetype hasn't changed so there cannot be any new components
+                continue;
             }
 
             // Store current values to histories, or create them
@@ -285,413 +283,4 @@ fn store_initial(
             }
         }
     }
-}
-#[cfg(test)]
-mod tests {
-    use super::{
-        super::{component_history::TickData, test_utils::*},
-        PredictedHistory, RollbackRegistry,
-    };
-    use crate::{Predicted, RollbackFrames};
-    use TickData::*;
-
-    use bevy::prelude::*;
-    use bevy_replicon::shared::replicon_tick::RepliconTick;
-
-    fn init_app() -> App {
-        let mut app = App::new();
-        app.init_resource::<super::ArchetypeCache>()
-            .init_resource::<RollbackFrames>()
-            .add_systems(Update, super::run_store);
-        app
-    }
-
-    #[test]
-    fn history_stores_changes() {
-        let mut app = init_app();
-
-        let e1 = app
-            .world_mut()
-            .spawn((Predicted, PredictedHistory::default(), A(1)))
-            .id();
-        let e2 = app
-            .world_mut()
-            .spawn((Predicted, PredictedHistory::default(), A(12)))
-            .id();
-
-        let mut registry = RollbackRegistry::default();
-        registry.register::<A>(app.world_mut());
-        app.insert_resource(registry);
-
-        for i in 0..=5 {
-            app.insert_resource(super::StoreFor(RepliconTick::new(i)));
-            app.update();
-            **app.world_mut().entity_mut(e1).get_mut::<A>().unwrap() += 1;
-            **app.world_mut().entity_mut(e2).get_mut::<A>().unwrap() -= 1;
-        }
-
-        let world = app.world_mut();
-        let comp_a = world.register_component::<A>();
-        use Missing as M;
-
-        let e = world.entity(e1);
-        let hist = e.get::<PredictedHistory>().unwrap();
-        assert!(hist.contains_key(&comp_a));
-        for (i, v) in [a(1), a(2), a(3), a(4), a(5), a(6), M].iter_enumerate() {
-            assert_eq!(v, hist.get(&comp_a).unwrap().get(i as u32).deref().cloned());
-        }
-
-        let e = world.entity(e2);
-        let hist = e.get::<PredictedHistory>().unwrap();
-        assert!(hist.contains_key(&comp_a));
-        for (i, v) in [a(12), a(11), a(10), a(9), a(8), a(7), M].iter_enumerate() {
-            assert_eq!(v, hist.get(&comp_a).unwrap().get(i as u32).deref().cloned());
-        }
-    }
-
-    #[test]
-    fn stores_removed() {
-        let mut app = init_app();
-
-        let e1 = app
-            .world_mut()
-            .spawn((Predicted, PredictedHistory::default(), A(1)))
-            .id();
-        let e2 = app
-            .world_mut()
-            .spawn((Predicted, PredictedHistory::default(), A(12)))
-            .id();
-
-        let mut registry = RollbackRegistry::default();
-        registry.register::<A>(app.world_mut());
-        app.insert_resource(registry);
-
-        for i in 0..=5 {
-            if i == 1 {
-                app.world_mut().entity_mut(e1).remove::<A>();
-            }
-            if i == 3 {
-                app.world_mut().entity_mut(e2).remove::<A>();
-            }
-
-            app.insert_resource(super::StoreFor(RepliconTick::new(i)));
-            app.update();
-        }
-
-        let world = app.world_mut();
-        let comp_a = world.register_component::<A>();
-
-        let e = world.entity(e1);
-        let hist = e.get::<PredictedHistory>().unwrap();
-        assert!(hist.contains_key(&comp_a));
-        for i in 0..=5 {
-            let v = hist
-                .get(&comp_a)
-                .unwrap()
-                .get(i as u32)
-                .deref::<()>()
-                .copied();
-            if i == 1 {
-                assert_eq!(Removed, v);
-            } else {
-                assert_ne!(Removed, v);
-            }
-        }
-
-        let e = world.entity(e2);
-        let hist = e.get::<PredictedHistory>().unwrap();
-        assert!(hist.contains_key(&comp_a));
-        for i in 0..=5 {
-            let v = hist
-                .get(&comp_a)
-                .unwrap()
-                .get(i as u32)
-                .deref::<()>()
-                .copied();
-            if i == 3 {
-                assert_eq!(Removed, v);
-            } else {
-                assert_ne!(Removed, v);
-            }
-        }
-    }
-
-    #[test]
-    fn history_skips_unchanged() {
-        let mut app = init_app();
-
-        let e1 = app
-            .world_mut()
-            .spawn((Predicted, PredictedHistory::default(), A(1), F(f32::NAN)))
-            .id();
-        let e2 = app
-            .world_mut()
-            .spawn((Predicted, PredictedHistory::default(), A(10), F(f32::NAN)))
-            .id();
-
-        let mut registry = RollbackRegistry::default();
-        registry.register::<A>(app.world_mut());
-        registry.register::<F>(app.world_mut());
-        app.insert_resource(registry);
-
-        for i in 0..7 {
-            app.insert_resource(super::StoreFor(RepliconTick::new(i)));
-            app.update();
-
-            let change = (i % 3 == 2) as u16;
-            // Always mark e1 changed, even if the value is unchanged
-            **app.world_mut().entity_mut(e1).get_mut::<A>().unwrap() += change;
-            **app.world_mut().entity_mut(e1).get_mut::<F>().unwrap() += change as f32;
-
-            // Only mark e2's A and F changed if we try to change it
-            if i % 3 == 0 {
-                **app.world_mut().entity_mut(e2).get_mut::<A>().unwrap() += 1;
-                **app.world_mut().entity_mut(e2).get_mut::<F>().unwrap() += 1.;
-            }
-        }
-
-        let world = app.world_mut();
-        let comp_a = world.register_component::<A>();
-        let comp_f = world.register_component::<F>();
-        use Missing as M;
-
-        let e = world.entity(e1);
-        let hist = e.get::<PredictedHistory>().unwrap();
-        assert!(hist.contains_key(&comp_a));
-        assert!(hist.contains_key(&comp_f));
-        for (i, v) in [a(1), M, M, a(2), M, M, a(3), M].iter_enumerate() {
-            assert_eq!(v, hist.get(&comp_a).unwrap().get(i as u32).deref().cloned());
-        }
-        for i in 0..7 {
-            let entry = hist.get(&comp_f).unwrap().get(i as u32);
-            assert!(matches!(entry, Value(_)));
-            let TickData::Value(f) = entry.deref::<F>() else {
-                panic!();
-            };
-            assert!(f.is_nan());
-        }
-
-        let e = world.entity(e2);
-        let hist = e.get::<PredictedHistory>().unwrap();
-        assert!(hist.contains_key(&comp_a));
-        assert!(hist.contains_key(&comp_f));
-        for (i, v) in [a(10), a(11), M, M, a(12), M, M, M].iter_enumerate() {
-            assert_eq!(v, hist.get(&comp_a).unwrap().get(i as u32).deref().cloned());
-        }
-        let (v, m) = (true, false);
-        for (i, v) in [v, v, m, m, v, m, m, m].iter_enumerate() {
-            if v {
-                let entry = hist.get(&comp_f).unwrap().get(i as u32);
-                assert!(matches!(entry, Value(_)));
-                let TickData::Value(f) = entry.deref::<F>() else {
-                    panic!();
-                };
-                assert!(f.is_nan());
-            } else {
-                assert_eq!(
-                    Missing,
-                    hist.get(&comp_f)
-                        .unwrap()
-                        .get(i as u32)
-                        .deref::<F>()
-                        .cloned()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn stores_reinserts() {
-        let mut app = init_app();
-
-        let e1 = app
-            .world_mut()
-            .spawn((Predicted, PredictedHistory::default(), A(1)))
-            .id();
-        let e2 = app
-            .world_mut()
-            .spawn((Predicted, PredictedHistory::default(), A(12)))
-            .id();
-
-        let mut registry = RollbackRegistry::default();
-        registry.register::<A>(app.world_mut());
-        app.insert_resource(registry);
-
-        for i in 0..=5 {
-            if i == 1 {
-                app.world_mut().entity_mut(e1).remove::<A>();
-            }
-            if i == 2 {
-                app.world_mut().entity_mut(e1).insert(A(2));
-                app.world_mut().entity_mut(e2).remove::<A>();
-            }
-            if i == 3 {
-                app.world_mut().entity_mut(e2).insert(A(20));
-            }
-
-            app.insert_resource(super::StoreFor(RepliconTick::new(i)));
-            app.update();
-        }
-
-        let world = app.world_mut();
-        let comp_a = world.register_component::<A>();
-        use Removed as R;
-
-        let e = world.entity(e1);
-        let hist = e.get::<PredictedHistory>().unwrap();
-        assert!(hist.contains_key(&comp_a));
-        for (i, v) in [(0, a(1)), (1, R), (2, a(2))] {
-            assert_eq!(v, hist.get(&comp_a).unwrap().get(i as u32).deref().cloned());
-        }
-
-        let e = world.entity(e2);
-        let hist = e.get::<PredictedHistory>().unwrap();
-        assert!(hist.contains_key(&comp_a));
-        for (i, v) in [(0, a(12)), (2, R), (3, a(20))] {
-            assert_eq!(v, hist.get(&comp_a).unwrap().get(i as u32).deref().cloned());
-        }
-    }
-
-    #[test]
-    fn stores_inserts() {
-        let mut app = init_app();
-
-        let e1 = app
-            .world_mut()
-            .spawn((Predicted, PredictedHistory::default(), A(1)))
-            .id();
-        let e2 = app
-            .world_mut()
-            .spawn((Predicted, PredictedHistory::default()))
-            .id();
-
-        let mut registry = RollbackRegistry::default();
-        registry.register::<A>(app.world_mut());
-        registry.register::<B>(app.world_mut());
-        app.insert_resource(registry);
-
-        for i in 0..=5 {
-            if i == 2 {
-                app.world_mut().entity_mut(e1).insert(B);
-            }
-            if i == 3 {
-                app.world_mut().entity_mut(e2).insert(A(2));
-            }
-
-            app.insert_resource(super::StoreFor(RepliconTick::new(i)));
-            app.update();
-        }
-
-        let world = app.world_mut();
-        let comp_a = world.register_component::<A>();
-        let comp_b = world.register_component::<B>();
-
-        let e = world.entity(e1);
-        let hist = e.get::<PredictedHistory>().unwrap();
-        assert!(hist.contains_key(&comp_a));
-        assert!(hist.contains_key(&comp_b));
-        for (i, v) in [(1, Missing), (2, Value(B))] {
-            assert_eq!(v, hist.get(&comp_b).unwrap().get(i as u32).deref().cloned());
-        }
-
-        let e = world.entity(e2);
-        let hist = e.get::<PredictedHistory>().unwrap();
-        assert!(hist.contains_key(&comp_a));
-        for (i, v) in [(2, Missing), (3, Value(A(2)))] {
-            assert_eq!(v, hist.get(&comp_a).unwrap().get(i as u32).deref().cloned());
-        }
-    }
-
-    #[test]
-    fn drop_once_unique_values() {
-        let mut app = init_app();
-        let drops = DropList::default();
-
-        let mut registry = RollbackRegistry::default();
-        registry.register::<D>(app.world_mut());
-        app.insert_resource(registry);
-
-        let e1 = app
-            .world_mut()
-            .spawn((Predicted, PredictedHistory::default(), D::new(1, &drops)))
-            .id();
-
-        for i in 0..5 {
-            app.insert_resource(super::StoreFor(RepliconTick::new(i)));
-            app.update();
-            app.world_mut().entity_mut(e1).get_mut::<D>().unwrap().0 += 1;
-        }
-
-        assert_drops(&drops, []);
-
-        app.world_mut().despawn(e1);
-
-        assert_drops(&drops, [6, 1, 2, 3, 4, 5]);
-    }
-
-    #[test]
-    fn drop_once_duplicates() {
-        let mut app = init_app();
-        let drops = DropList::default();
-
-        let mut registry = RollbackRegistry::default();
-        registry.register::<D>(app.world_mut());
-        app.insert_resource(registry);
-
-        let e1 = app
-            .world_mut()
-            .spawn((Predicted, PredictedHistory::default(), D::new(1, &drops)))
-            .id();
-
-        for i in 0..5 {
-            app.insert_resource(super::StoreFor(RepliconTick::new(i)));
-            app.update();
-            // Mark the component changes to make sure the more complex branch is used
-            app.world_mut()
-                .entity_mut(e1)
-                .get_mut::<D>()
-                .unwrap()
-                .set_changed();
-        }
-        // Update afterwards to prevent a double drop of D(1)
-        app.world_mut().entity_mut(e1).get_mut::<D>().unwrap().0 += 1;
-
-        assert_drops(&drops, []);
-
-        app.world_mut().despawn(e1);
-
-        assert_drops(&drops, [2, 1]);
-    }
-
-    #[test]
-    fn drop_once_out_of_bounds() {
-        let mut app = init_app();
-        let drops = DropList::default();
-
-        let mut registry = RollbackRegistry::default();
-        registry.register::<D>(app.world_mut());
-        app.insert_resource(registry);
-
-        let e1 = app
-            .world_mut()
-            .spawn((Predicted, PredictedHistory::default(), D::new(1, &drops)))
-            .id();
-
-        app.insert_resource(super::StoreFor(RepliconTick::new(10)));
-        app.update();
-        app.world_mut().entity_mut(e1).get_mut::<D>().unwrap().0 += 1;
-
-        // Write to a tick that is old enough that it won't be written
-        app.insert_resource(super::StoreFor(RepliconTick::new(2)));
-        app.update();
-
-        // The value was never cloned so it should not have been dropped either
-        assert_drops(&drops, []);
-
-        app.world_mut().despawn(e1);
-
-        assert_drops(&drops, [2, 1]);
-    }
-
-    // TODO: Test cleanup of histories
 }

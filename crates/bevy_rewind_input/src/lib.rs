@@ -8,12 +8,12 @@ mod queue;
 pub use queue::InputQueue;
 
 mod history;
-pub use history::{InputHistory, INPUT_HISTORY_CAPACITY};
+pub use history::{INPUT_HISTORY_CAPACITY, InputHistory};
 
 #[cfg(feature = "client")]
-mod client;
+pub mod client;
 #[cfg(feature = "server")]
-mod server;
+pub mod server;
 #[cfg(feature = "server")]
 pub use server::InputTarget;
 
@@ -109,10 +109,7 @@ pub trait InputTrait:
     /// Implementors that want a hard cap can override this with their own
     /// `since`-aware logic.
     fn repeated(&self, _since: u32) -> Option<Self> {
-        if !Self::repeats() {
-            return None;
-        }
-        Some(self.clone())
+        Self::repeats().then(|| self.clone())
     }
 }
 
@@ -161,13 +158,20 @@ impl Default for ConfirmedHorizon {
 /// Flagged for the on-device feel pass.
 pub const SEAL_GRACE_TICKS: u32 = 2;
 
+/// The server→client broadcast of a body's input around a stamp tick: a small
+/// window of already-consumed `past` inputs (redundancy against loss) plus the
+/// still-queued `future` inputs, each stored as an offset from `tick`.
 #[derive(Message, Clone, TypePath, Serialize, Deserialize, PartialEq, Eq, Debug)]
 #[serde(bound(deserialize = "T: for<'de2> serde::Deserialize<'de2>"))]
-struct HistoryFor<T: InputTrait> {
-    entity: Entity,
-    tick: RepliconTick,
-    past: ArrayVec<(u8, T), 3>,
-    future: ArrayVec<(u8, T), 7>,
+pub struct HistoryFor<T: InputTrait> {
+    /// The body the inputs belong to.
+    pub entity: Entity,
+    /// The stamp tick offsets are relative to.
+    pub tick: RepliconTick,
+    /// Already-consumed inputs, as (offset below `tick`, input) pairs.
+    pub past: ArrayVec<(u8, T), 3>,
+    /// Still-queued inputs, as (offset at/above `tick`, input) pairs.
+    pub future: ArrayVec<(u8, T), 7>,
 }
 
 impl<T: InputTrait> MapEntities for HistoryFor<T> {
@@ -179,40 +183,5 @@ impl<T: InputTrait> MapEntities for HistoryFor<T> {
         self.future
             .iter_mut()
             .for_each(|(_, t)| t.map_entities(mapper));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    pub use crate::history::tests::hist;
-
-    #[derive(Resource, Clone, Copy, Deref, DerefMut, PartialEq, Eq, Debug, Default)]
-    pub struct Tick(pub u32);
-
-    impl From<RepliconTick> for Tick {
-        fn from(value: RepliconTick) -> Self {
-            Self(value.get())
-        }
-    }
-
-    impl From<Tick> for RepliconTick {
-        fn from(value: Tick) -> Self {
-            RepliconTick::new(value.0)
-        }
-    }
-
-    #[derive(Component, Clone, Default, Serialize, Deserialize, Debug, PartialEq, TypePath)]
-    pub struct A(pub u8);
-
-    impl InputTrait for A {
-        fn repeats() -> bool {
-            true
-        }
-    }
-
-    impl MapEntities for A {
-        fn map_entities<M: EntityMapper>(&mut self, _: &mut M) {}
     }
 }

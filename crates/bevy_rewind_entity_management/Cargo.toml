@@ -3,10 +3,22 @@ name = "bevy_rewind_entity_management"
 version = "0.1.0"
 edition = "2024"
 
-[lints]
-workspace = true
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+# Bevy ECS queries are inherently complex and would fire this lint pervasively.
+type_complexity = "allow"
 
 [dependencies]
-bevy.workspace = true
-bevy_replicon.workspace = true
-bevy_rewind.workspace = true
+bevy = { path = "../../../third_party/bevy", default-features = false, features = ["bevy_log"] }
+bevy_replicon = { path = "../../../third_party/bevy_replicon", default-features = false }
+bevy_rewind = { path = "../bevy_rewind" }
+
+[dev-dependencies]
+# The test suite drives the replicon despawn flow through the in-memory test
+# backend, which needs the client/server halves of replicon.
+bevy_replicon = { path = "../../../third_party/bevy_replicon", default-features = false, features = ["client", "server"] }
+mutants = "0.0.3"
+proptest = "1"
+serde = { version = "1", features = ["derive"] }

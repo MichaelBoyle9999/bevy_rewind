@@ -9,11 +9,11 @@ use core::num::NonZero;
 
 use bevy::ptr::{OwningPtr, Ptr, PtrMut};
 
-pub(crate) struct SparseBlobDeque {
+pub struct SparseBlobDeque {
     mask: u64,
     len: u8,
     capacity: u8,
-    items: BlobDeque,
+    pub items: BlobDeque,
 }
 
 impl core::fmt::Debug for SparseBlobDeque {
@@ -89,6 +89,11 @@ impl SparseBlobDeque {
         self.items.get(item_index as usize)
     }
 
+    /// Append an entry to the back, `None` meaning an empty (sparse) entry
+    ///
+    /// # Safety
+    /// - The value written in `write_fn` MUST match the type this collection was made for
+    /// - `write_fn` MUST write to the [`PtrMut`], or the value will be uninitialized
     pub unsafe fn append<'a>(&mut self, write_fn: Option<impl FnOnce(PtrMut<'a>)>) {
         if self.len == self.capacity {
             let index_bit = 1 << (self.len - 1);
@@ -157,6 +162,11 @@ impl SparseBlobDeque {
         self.len = 0;
     }
 
+    /// Replace the entry at `index` with a value
+    ///
+    /// # Safety
+    /// - The value written in `write_fn` MUST match the type this collection was made for
+    /// - `write_fn` MUST write to the [`PtrMut`], or the value will be uninitialized
     pub unsafe fn replace(&mut self, index: usize, write_fn: impl FnOnce(PtrMut)) {
         if index >= self.len() {
             return;
@@ -188,350 +198,5 @@ impl SparseBlobDeque {
 
         self.mask |= index_bit;
         unsafe { self.items.insert(ones as usize, write_fn).unwrap() };
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use core::mem::MaybeUninit;
-    use core::num::NonZero;
-
-    use bevy::ptr::PtrMut;
-
-    use super::{super::test_utils::*, SparseBlobDeque};
-
-    #[test]
-    fn get() {
-        let mut history = SparseBlobDeque::from_type::<A>(NonZero::new(5).unwrap());
-        assert_eq!(None, history.get(0).deref::<A>());
-
-        for i in 0..3 {
-            if i % 2 == 0 {
-                unsafe { history.append(Some(|ptr: PtrMut| *ptr.deref_mut() = A(i * 5))) };
-            } else {
-                unsafe { history.append(None::<fn(PtrMut)>) };
-            }
-        }
-        unsafe { history.append(Some(|ptr: PtrMut| *ptr.deref_mut() = A(3))) };
-
-        for (i, a) in [Some(&A(0)), None, Some(&A(10)), Some(&A(3)), None].iter_enumerate() {
-            assert_eq!(a, history.get(i).deref());
-        }
-    }
-
-    #[test]
-    fn append_full() {
-        let mut history = SparseBlobDeque::from_type::<A>(NonZero::new(5).unwrap());
-
-        for i in 0..5 {
-            unsafe { history.append(Some(|ptr: PtrMut| *ptr.deref_mut::<A>() = A(i + 1))) };
-        }
-
-        assert_eq!(5, history.len());
-        assert_eq!(5, history.stored_items());
-        for i in 0..5 {
-            assert_eq!(Some(&A(i as u16 + 1)), history.get(i).deref::<A>());
-        }
-
-        unsafe { history.append(Some(|ptr: PtrMut| *ptr.deref_mut::<A>() = A(6))) };
-        assert_eq!(5, history.len());
-        assert_eq!(5, history.stored_items());
-        for i in 0..5 {
-            assert_eq!(Some(&A(i as u16 + 2)), history.get(i).deref::<A>());
-        }
-    }
-
-    #[test]
-    fn dense_storage() {
-        let mut history = SparseBlobDeque::from_type::<A>(NonZero::new(10).unwrap());
-        assert_eq!(None, history.get(0).deref::<A>());
-        assert_eq!(1, history.items.capacity());
-
-        for _ in 0..5 {
-            unsafe { history.append(None::<fn(PtrMut)>) };
-        }
-
-        // None items shouldn't add capacity
-        assert_eq!(5, history.len());
-        assert_eq!(1, history.items.capacity());
-
-        unsafe { history.append(Some(|ptr: PtrMut| *ptr.deref_mut() = A(1))) };
-        // We shouldn't need to expand yet
-        assert_eq!(1, history.items.len());
-        assert_eq!(1, history.items.capacity());
-
-        unsafe { history.append(Some(|ptr: PtrMut| *ptr.deref_mut() = A(2))) };
-        // Expand to fit just the new item
-        assert_eq!(2, history.items.len());
-        assert_eq!(2, history.items.capacity());
-
-        for _ in 0..10 {
-            unsafe { history.append(None::<fn(PtrMut)>) };
-        }
-
-        // We don't release memory if the items are wrapped out of history
-        assert_eq!(0, history.items.len());
-        assert_eq!(2, history.items.capacity());
-
-        for i in 0..10 {
-            unsafe { history.append(Some(|ptr: PtrMut| *ptr.deref_mut() = A(i))) };
-        }
-
-        // We should never make it exceed our own capacity
-        assert_eq!(10, history.items.len());
-        assert_eq!(10, history.items.capacity());
-    }
-
-    #[test]
-    fn append_get_max_mask() {
-        let mut history = SparseBlobDeque::from_type::<A>(NonZero::new(64).unwrap());
-        assert_eq!(None, history.get(0).deref::<A>());
-
-        for i in 0..(64 + 24) {
-            if i % 2 == 0 {
-                unsafe { history.append(Some(|ptr: PtrMut| *ptr.deref_mut() = A(i))) };
-            } else {
-                unsafe { history.append(None::<fn(PtrMut)>) };
-            }
-        }
-
-        assert_eq!(64, history.len());
-
-        for i in 0..64 {
-            let a = history.get(i);
-            if i % 2 == 0 {
-                assert_eq!(Some(&A(i as u16 + 24)), a.deref());
-            } else {
-                assert_eq!(None, a.deref::<A>());
-            }
-        }
-    }
-
-    #[test]
-    fn append_sparse_wrap_drops_items() {
-        let mut history = SparseBlobDeque::from_type::<D>(NonZero::new(5).unwrap());
-        let drops = DropList::default();
-
-        eprintln!("Before");
-        for i in 0..6 {
-            eprintln!("Appending {i}");
-            if i % 2 == 0 {
-                unsafe {
-                    history.append(Some(|ptr: PtrMut| {
-                        ptr.deref_mut::<MaybeUninit<D>>().write(D::new(i, &drops));
-                    }));
-                };
-            } else {
-                unsafe { history.append(None::<fn(PtrMut)>) };
-            }
-            eprintln!("- done {i}");
-        }
-
-        assert_eq!(5, history.len());
-        assert_eq!(2, history.stored_items());
-        assert_drops(&drops, [0]);
-
-        for i in [0, 2, 4, 5] {
-            assert_eq!(None, history.get(i).deref::<D>());
-        }
-        for i in [1, 3] {
-            assert_eq!(Some(i as u16 + 1), history.get(i).deref::<D>().map(|v| v.0));
-        }
-
-        drop(history);
-        assert_drops(&drops, [0, 2, 4]);
-    }
-
-    #[test]
-    fn append_dense_wrap_drops_items_full() {
-        let mut history = SparseBlobDeque::from_type::<D>(NonZero::new(5).unwrap());
-        assert_eq!(None, history.get(0).deref::<D>());
-        let drops = DropList::default();
-
-        for i in 0..5 {
-            unsafe {
-                history.append(Some(|ptr: PtrMut| {
-                    ptr.deref_mut::<MaybeUninit<D>>()
-                        .write(D::new(i + 1, &drops));
-                }));
-            };
-        }
-
-        assert_eq!(5, history.len());
-        assert_eq!(5, history.stored_items());
-        assert_drops(&drops, []);
-
-        unsafe {
-            history.append(Some(|ptr: PtrMut| {
-                ptr.deref_mut::<MaybeUninit<D>>().write(D::new(6, &drops));
-            }));
-        };
-        assert_eq!(5, history.len());
-        assert_eq!(5, history.stored_items());
-        assert_drops(&drops, [1]);
-
-        drop(history);
-        assert_drops(&drops, [1, 2, 3, 4, 5, 6]);
-    }
-
-    #[test]
-    fn extend_front() {
-        let mut history = SparseBlobDeque::from_type::<A>(NonZero::new(5).unwrap());
-
-        unsafe { history.append(Some(|ptr: PtrMut| *ptr.deref_mut::<A>() = A(1))) };
-        assert_eq!(1, history.len());
-        assert_eq!(Some(&A(1)), history.get(0).deref());
-
-        history.extend_front(2);
-        assert_eq!(3, history.len());
-        for i in 0..2 {
-            assert_eq!(None, history.get(i).deref::<A>());
-        }
-        assert_eq!(Some(&A(1)), history.get(2).deref());
-
-        history.extend_front(7);
-        assert_eq!(5, history.len());
-        for i in 0..4 {
-            assert_eq!(None, history.get(i).deref::<A>());
-        }
-        assert_eq!(Some(&A(1)), history.get(4).deref());
-    }
-
-    #[test]
-    fn extend_back() {
-        let mut history = SparseBlobDeque::from_type::<A>(NonZero::new(5).unwrap());
-
-        unsafe { history.append(Some(|ptr: PtrMut| *ptr.deref_mut::<A>() = A(1))) };
-        assert_eq!(1, history.len());
-
-        // Extend the back without needing to remove anything
-        history.extend_back(2);
-        assert_eq!(3, history.len());
-        assert_eq!(Some(&A(1)), history.get(0).deref());
-        for i in 1..4 {
-            assert_eq!(None, history.get(i).deref::<A>());
-        }
-
-        unsafe { history.append(Some(|ptr: PtrMut| *ptr.deref_mut::<A>() = A(2))) };
-        unsafe { history.append(Some(|ptr: PtrMut| *ptr.deref_mut::<A>() = A(3))) };
-        assert_eq!(5, history.len());
-        assert_eq!(3, history.stored_items());
-
-        // Wrap items out of history with empty items
-        history.extend_back(4);
-        eprintln!("{:?}", history);
-        assert_eq!(5, history.len());
-        assert_eq!(1, history.stored_items());
-        assert_eq!(Some(&A(3)), history.get(0).deref());
-        for i in 1..6 {
-            assert_eq!(None, history.get(i).deref::<A>());
-        }
-
-        // Wrap more than full capacity
-        history.extend_back(7);
-        assert_eq!(5, history.len());
-        assert_eq!(0, history.stored_items());
-        for i in 0..6 {
-            assert_eq!(None, history.get(i).deref::<A>());
-        }
-    }
-
-    #[test]
-    fn trim_back() {
-        let mut history = SparseBlobDeque::from_type::<A>(NonZero::new(5).unwrap());
-
-        for i in 1..=5 {
-            unsafe { history.append(Some(|ptr: PtrMut| *ptr.deref_mut::<A>() = A(i))) };
-        }
-        assert_eq!(5, history.len());
-
-        history.trim_back(1);
-        assert_eq!(4, history.len());
-        for (i, v) in (1..=4).iter_enumerate() {
-            assert_eq!(Some(&A(v)), history.get(i).deref());
-        }
-        assert_eq!(None, history.get(4).deref::<A>());
-
-        history.trim_back(2);
-        assert_eq!(2, history.len());
-        for (i, v) in (1..=2).iter_enumerate() {
-            assert_eq!(Some(&A(v)), history.get(i).deref());
-        }
-        assert_eq!(None, history.get(3).deref::<A>());
-
-        history.extend_back(2);
-        assert_eq!(4, history.len());
-        for (i, v) in (1..=2).iter_enumerate() {
-            assert_eq!(Some(&A(v)), history.get(i).deref());
-        }
-        for i in 3..5 {
-            assert_eq!(None, history.get(i).deref::<A>());
-        }
-
-        history.trim_back(1);
-        assert_eq!(3, history.len());
-        for (i, v) in (1..=2).iter_enumerate() {
-            assert_eq!(Some(&A(v)), history.get(i).deref());
-        }
-
-        history.trim_back(6);
-        assert_eq!(0, history.len());
-        for i in 0..6 {
-            assert_eq!(None, history.get(i).deref::<A>());
-        }
-    }
-
-    #[test]
-    fn replace() {
-        let mut history = SparseBlobDeque::from_type::<A>(NonZero::new(5).unwrap());
-
-        for i in 1..=3 {
-            unsafe { history.append(Some(|ptr: PtrMut| *ptr.deref_mut() = A(i))) };
-        }
-
-        assert_eq!(3, history.len());
-        assert_eq!(3, history.stored_items());
-
-        unsafe { history.replace(1, |ptr| *ptr.deref_mut() = A(5)) };
-        for (i, v) in [1, 5, 3].into_iter().enumerate() {
-            assert_eq!(Some(&A(v)), history.get(i).deref::<A>());
-        }
-
-        unsafe { history.replace(2, |ptr| *ptr.deref_mut() = A(6)) };
-        for (i, v) in [1, 5, 6].into_iter().enumerate() {
-            assert_eq!(Some(&A(v)), history.get(i).deref::<A>());
-        }
-
-        unsafe { history.replace(0, |ptr| *ptr.deref_mut() = A(4)) };
-        for (i, v) in (4..=6).enumerate() {
-            assert_eq!(Some(&A(v)), history.get(i).deref::<A>());
-        }
-    }
-
-    #[test]
-    fn replace_empty() {
-        let mut history = SparseBlobDeque::from_type::<A>(NonZero::new(5).unwrap());
-
-        for _ in 0..3 {
-            unsafe { history.append(None::<fn(PtrMut)>) };
-        }
-
-        assert_eq!(3, history.len());
-        assert_eq!(0, history.stored_items());
-
-        unsafe { history.replace(1, |ptr| *ptr.deref_mut() = A(2)) };
-        assert_eq!(Some(&A(2)), history.get(1).deref());
-        assert_eq!(None, history.get(0).deref::<A>());
-        assert_eq!(None, history.get(2).deref::<A>());
-
-        unsafe { history.replace(2, |ptr| *ptr.deref_mut() = A(3)) };
-        assert_eq!(Some(&A(3)), history.get(2).deref::<A>());
-        assert_eq!(None, history.get(0).deref::<A>());
-
-        unsafe { history.replace(0, |ptr| *ptr.deref_mut() = A(1)) };
-
-        for i in 0..3 {
-            assert_eq!(Some(&A(i as u16 + 1)), history.get(i).deref::<A>());
-        }
     }
 }
