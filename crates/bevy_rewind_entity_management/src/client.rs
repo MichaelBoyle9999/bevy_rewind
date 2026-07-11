@@ -1,8 +1,4 @@
-use crate::{
-    EntityManagementCommands, EntityManagementDeferredWorld, EntityManagementEntityWorldMut,
-    EntityManagementWorld, SpawnPlugin, SpawnReason, Spawned, SpawnedAt, SpawnedEntities,
-    SpawnedEntity, ToRemove,
-};
+use crate::SpawnedAt;
 
 use std::marker::PhantomData;
 
@@ -10,12 +6,9 @@ use bevy::{
     ecs::{entity_disabling::Disabled, lifecycle::HookContext, world::DeferredWorld},
     prelude::*,
 };
-use bevy_replicon::{
-    prelude::{ClientState, Signature},
-    shared::{
-        replication::registry::{ReplicationRegistry, ctx::DespawnCtx},
-        replicon_tick::RepliconTick,
-    },
+use bevy_replicon::shared::{
+    replication::registry::{ReplicationRegistry, ctx::DespawnCtx},
+    replicon_tick::RepliconTick,
 };
 use bevy_rewind::{
     Predicted, Resimulating, RollbackFrames, RollbackSchedule, RollbackStoreSet, RollbackTarget,
@@ -59,9 +52,7 @@ impl<Tick: TickSource> Plugin for EntityManagementPlugin<Tick> {
             )
                 .before(RollbackStoreSet),
         )
-        .insert_resource(GetTick(|world| (*world.resource::<Tick>()).into()))
         .insert_resource(GetTickDeferred(|world| (*world.resource::<Tick>()).into()))
-        .init_resource::<ToRemove>()
         .add_observer(stamp_spawned_at::<Tick>)
         .add_systems(
             RollbackSchedule::PreRollback,
@@ -76,9 +67,8 @@ impl<Tick: TickSource> Plugin for EntityManagementPlugin<Tick> {
 }
 
 /// Stamp [`SpawnedAt`] onto a newly-added [`Predicted`] entity from the current
-/// tick source. Skips during a resim so a rollback-driven re-add (e.g. via
-/// `reuse_spawn` after the entity was disabled past its original spawn tick) does
-/// not overwrite the original tick.
+/// tick source. Skips during a resim so a rollback-driven re-add does not
+/// overwrite the original tick.
 fn stamp_spawned_at<Tick: TickSource>(
     add: On<Add, Predicted>,
     mut commands: Commands,
@@ -146,20 +136,6 @@ fn reenable_at_spawn_tick<Tick: TickSource>(
     }
 }
 
-fn world_has_authority(world: &World) -> bool {
-    let Some(state) = world.get_resource::<State<ClientState>>() else {
-        return true;
-    };
-    *state.get() == ClientState::Disconnected
-}
-
-fn spawned_has_authority<R: SpawnReason>(spawned: &Spawned<'_, R>) -> bool {
-    let Some(ref state) = spawned.authority else {
-        return true;
-    };
-    *state.get() == ClientState::Disconnected
-}
-
 fn replicon_despawn<Tick: TickSource>(ctx: &DespawnCtx, mut entity: EntityWorldMut) {
     if entity.contains::<Predicted>() {
         if ctx.message_tick >= (*entity.world().resource::<Tick>()).into() {
@@ -196,24 +172,7 @@ fn disable_server_despawned_entities<Tick: TickSource>(
 }
 
 #[derive(Resource)]
-struct GetTick(fn(&World) -> RepliconTick);
-
-#[derive(Resource)]
 struct GetTickDeferred(fn(&DeferredWorld) -> RepliconTick);
-
-impl<Reason: SpawnReason> Plugin for SpawnPlugin<Reason> {
-    fn build(&self, app: &mut App) {
-        app.init_resource::<SpawnedEntities<Reason>>().add_systems(
-            RollbackSchedule::BackToPresent,
-            (
-                (|world: &World| -> RepliconTick { world.resource::<GetTick>().0(world) })
-                    .pipe(clean_spawned_entities_system::<Reason>),
-                reset_removals,
-            )
-                .chain(),
-        );
-    }
-}
 
 /// A marker for entities that should be despawned once they fall out of history
 #[derive(Component, Clone, Copy)]
@@ -277,233 +236,5 @@ fn despawn_unspawned_entities(
 ) {
     for entity in query.iter() {
         commands.entity(entity).try_despawn();
-    }
-}
-
-impl<Reason: SpawnReason> SpawnedEntities<Reason> {
-    fn get(&self, reason: &Reason) -> Option<Entity> {
-        self.0.get(reason).map(|e| e.id)
-    }
-
-    fn get_and_update(&mut self, reason: &Reason, tick: RepliconTick) -> Option<Entity> {
-        self.0.get_mut(reason).map(|e| {
-            e.last_spawned = RepliconTick::new(e.last_spawned.get().max(tick.get()));
-            e.id
-        })
-    }
-
-    fn insert(&mut self, reason: Reason, tick: RepliconTick, id: Entity) {
-        self.0.insert(
-            reason,
-            SpawnedEntity {
-                id,
-                last_spawned: tick,
-            },
-        );
-    }
-
-    fn update(&mut self, reason: &Reason, tick: RepliconTick) {
-        if let Some(e) = self.0.get_mut(reason) {
-            e.last_spawned = RepliconTick::new(e.last_spawned.get().max(tick.get()));
-        }
-    }
-}
-
-#[derive(Component)]
-#[component(on_remove = mark_for_removal)]
-struct Reuse;
-
-fn mark_for_removal(mut world: DeferredWorld, ctx: HookContext) {
-    world.resource_mut::<ToRemove>().insert(ctx.entity);
-}
-
-fn clean_spawned_entities_system<Reason: SpawnReason>(
-    In(tick): In<RepliconTick>,
-    mut entities: ResMut<SpawnedEntities<Reason>>,
-    frames: Res<bevy_rewind::RollbackFrames>,
-    removed: Res<ToRemove>,
-) {
-    let max_ticks = frames.history_size() as u32;
-
-    entities.0.retain(|_key, entity| {
-        !removed.contains(&entity.id) && tick < entity.last_spawned + max_ticks
-    });
-}
-
-fn reset_removals(mut removed: ResMut<ToRemove>) {
-    removed.clear();
-}
-
-impl EntityManagementCommands for Commands<'_, '_> {
-    fn reuse_spawn<Reason: SpawnReason>(
-        &mut self,
-        spawned: &Spawned<Reason>,
-        reason: Reason,
-        bundle: impl Bundle,
-    ) -> Entity {
-        if spawned_has_authority(spawned) {
-            return self.spawn(bundle).id();
-        }
-
-        if let Some(entity) = spawned.entities.get(&reason)
-            && !spawned.to_remove.contains(&entity)
-        {
-            if let Ok(mut entity_cmd) = self.get_entity(entity) {
-                entity_cmd.commands().queue(UpdateSpawnedEntity(reason));
-                // Remove the lifecycle markers one at a time: bundle removal
-                // fires all `on_remove` hooks before removing anything, so a
-                // combined remove would leave `reenable` seeing the *other*
-                // marker still present both times and never drop `Disabled`.
-                entity_cmd
-                    .insert(bundle)
-                    .remove::<Despawned>()
-                    .remove::<Unspawned>();
-                return entity;
-            }
-            warn!("Failed to reuse {}, creating new entity", entity);
-        }
-
-        let new_entity = self.spawn((Reuse, bundle, Signature::from(&reason))).id();
-        self.queue(InsertSpawnedEntity(reason, new_entity));
-        new_entity
-    }
-
-    fn register_reuse<Reason: SpawnReason>(
-        &mut self,
-        spawned: &Spawned<Reason>,
-        reason: Reason,
-        entity: Entity,
-    ) {
-        if !spawned_has_authority(spawned) {
-            // TODO: Add Reuse to registered entity
-            self.queue(InsertSpawnedEntity(reason, entity));
-        }
-    }
-
-    fn disable_or_despawn(&mut self, entity: Entity) {
-        let Ok(mut ec) = self.get_entity(entity) else {
-            return;
-        };
-        ec.queue_silenced(|entity: EntityWorldMut| entity.disable_or_despawn());
-    }
-}
-
-impl EntityManagementEntityWorldMut for EntityWorldMut<'_> {
-    fn disable_or_despawn(mut self) {
-        if world_has_authority(self.world()) {
-            self.despawn();
-            return;
-        }
-
-        self.insert(Despawned);
-        self.flush();
-    }
-}
-
-impl EntityManagementWorld for World {
-    fn reuse_spawn<'a, Reason: SpawnReason>(
-        &'a mut self,
-        reason: Reason,
-        bundle: impl Bundle,
-    ) -> EntityWorldMut<'a> {
-        if world_has_authority(self) {
-            return self.spawn(bundle);
-        }
-
-        let get_tick = self.resource::<GetTick>();
-        let tick = get_tick.0(self);
-
-        let mut entities = self.resource_mut::<SpawnedEntities<Reason>>();
-
-        if let Some(entity) = entities.get_and_update(&reason, tick)
-            && !self.resource::<ToRemove>().contains(&entity)
-            && self.entities().contains(entity)
-        {
-            let mut entity_mut = self.entity_mut(entity);
-            // Remove the lifecycle markers one at a time: bundle removal fires
-            // all `on_remove` hooks before removing anything, so a combined
-            // remove would leave `reenable` seeing the *other* marker still
-            // present both times and never drop `Disabled`.
-            entity_mut
-                .insert(bundle)
-                .remove::<Despawned>()
-                .remove::<Unspawned>();
-            return entity_mut;
-        }
-
-        let new_entity = self.spawn((Reuse, bundle, Signature::from(&reason))).id();
-        self.resource_mut::<SpawnedEntities<Reason>>()
-            .insert(reason, tick, new_entity);
-        self.entity_mut(new_entity)
-    }
-
-    fn register_reuse<Reason: SpawnReason>(&mut self, reason: Reason, entity: Entity) {
-        if world_has_authority(self) {
-            return;
-        }
-
-        let get_tick = self.resource::<GetTick>();
-        let tick = get_tick.0(self);
-
-        // TODO: Add Reuse to registered entity
-        self.resource_mut::<SpawnedEntities<Reason>>()
-            .insert(reason, tick, entity);
-    }
-
-    fn disable_or_despawn(&mut self, entity: Entity) {
-        if !self.entities().contains(entity) {
-            return;
-        }
-        if world_has_authority(self) {
-            self.despawn(entity);
-            return;
-        }
-
-        let mut entity_mut = self.entity_mut(entity);
-        entity_mut.insert(Despawned);
-        self.flush();
-    }
-}
-
-impl EntityManagementDeferredWorld for DeferredWorld<'_> {
-    fn register_reuse<Reason: SpawnReason>(&mut self, reason: Reason, entity: Entity) {
-        if world_has_authority(self) {
-            return;
-        }
-
-        let get_tick = self.resource::<GetTick>();
-        let tick = get_tick.0(self);
-
-        // TODO: Add Reuse to registered entity
-        self.resource_mut::<SpawnedEntities<Reason>>()
-            .insert(reason, tick, entity);
-    }
-}
-
-struct InsertSpawnedEntity<Reason: SpawnReason>(pub Reason, pub Entity);
-
-impl<Reason: SpawnReason> Command for InsertSpawnedEntity<Reason> {
-    fn apply(self, world: &mut World) {
-        let get_tick = world.resource::<GetTick>();
-        let tick = get_tick.0(world);
-
-        let mut entities = world.resource_mut::<SpawnedEntities<Reason>>();
-        #[cfg(debug_assertions)]
-        if entities.0.contains_key(&self.0) {
-            warn!("Duplicate insert for key: {:?}", self.0);
-        }
-        entities.insert(self.0, tick, self.1);
-    }
-}
-
-struct UpdateSpawnedEntity<Reason: SpawnReason>(pub Reason);
-
-impl<Reason: SpawnReason> Command for UpdateSpawnedEntity<Reason> {
-    fn apply(self, world: &mut World) {
-        let get_tick = world.resource::<GetTick>();
-        let tick = get_tick.0(world);
-
-        let mut entities = world.resource_mut::<SpawnedEntities<Reason>>();
-        entities.update(&self.0, tick);
     }
 }
