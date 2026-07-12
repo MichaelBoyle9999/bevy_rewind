@@ -1,5 +1,3 @@
-//! A crate for generic rollback handling in bevy
-
 pub mod history;
 use history::RollbackRegistry;
 pub use history::{
@@ -34,32 +32,22 @@ use bevy_replicon::{
     },
 };
 
-/// The source of the current simulation tick
 pub trait TickSource: Resource + Copy + From<RepliconTick> + Into<RepliconTick> {}
 
 impl<T> TickSource for T where T: Resource + Copy + From<RepliconTick> + Into<RepliconTick> {}
 
-/// A set in which systems storing state run
 #[derive(SystemSet, Clone, PartialEq, Eq, Debug, Hash)]
 pub struct RollbackStoreSet;
 
-/// A set in which systems loading from history run
 #[derive(SystemSet, Clone, PartialEq, Eq, Debug, Hash)]
 pub struct RollbackLoadSet;
 
-/// A set in which histories are added
 #[derive(SystemSet, Clone, PartialEq, Eq, Debug, Hash)]
 pub struct AddHistorySet;
 
-/// A plugin that adds rollback logic to an app
 pub struct RollbackPlugin<Tick: TickSource> {
-    /// The schedule in which state is stored, all systems storing state are placed in
-    /// the [`RollbackStoreSet`]. This usually runs at the end of your simulation.
     pub store_schedule: Interned<dyn ScheduleLabel>,
-    /// The schedule that is executed for a rollback, this is either your simulation or a
-    /// schedule that executes your simulation along with some extra stuff before and after it.
     pub rollback_schedule: Interned<dyn ScheduleLabel>,
-    /// phantom nonsense
     pub phantom: PhantomData<Tick>,
 }
 
@@ -74,37 +62,29 @@ impl<Tick: TickSource> Plugin for RollbackPlugin<Tick> {
             need_history: true,
         })
         .track_mutate_messages()
-        // Init schedules
         .init_schedule(RollbackSchedule::PreRollback)
         .init_schedule(RollbackSchedule::Rollback)
         .init_schedule(RollbackSchedule::PostRollback)
         .init_schedule(RollbackSchedule::PreResimulation)
         .init_schedule(RollbackSchedule::PostResimulation)
         .init_schedule(RollbackSchedule::BackToPresent)
-        // Since all our schedules probably won't run many systems
-        // the single threaded executor should be faster
         .edit_schedule(RollbackSchedule::PreRollback, make_single_threaded)
         .edit_schedule(RollbackSchedule::Rollback, make_single_threaded)
         .edit_schedule(RollbackSchedule::PostRollback, make_single_threaded)
         .edit_schedule(RollbackSchedule::PreResimulation, make_single_threaded)
         .edit_schedule(RollbackSchedule::PostResimulation, make_single_threaded)
         .edit_schedule(RollbackSchedule::BackToPresent, make_single_threaded)
-        // Configure run condition for PreResimulation on the first frame
         .configure_sets(
             RollbackSchedule::PreResimulation,
             RollbackLoadSet.run_if(not(resource_exists::<AlreadyLoaded>)),
         )
-        // Init resources
         .init_resource::<RollbackRegistry>()
         .init_resource::<RollbackFrames>()
         .init_resource::<RollbackTarget>()
         .init_resource::<RequestedRollback>()
-        // Store configured schedules
         .insert_resource(StoreScheduleLabel(self.store_schedule))
         .insert_resource(SimulationScheduleLabel(self.rollback_schedule))
-        // Set up the history plugin
         .add_plugins(history::HistoryPlugin)
-        // Set up resimulate systems
         .add_systems(
             self.store_schedule,
             set_store_tick::<Tick>.before(RollbackStoreSet),

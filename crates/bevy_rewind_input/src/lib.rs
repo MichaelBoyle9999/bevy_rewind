@@ -1,5 +1,3 @@
-//! A crate adding input queue and history logic to `bevy_replicon` apps.
-
 use arrayvec::ArrayVec;
 
 #[cfg(feature = "server")]
@@ -25,12 +23,10 @@ use bevy::{
 use bevy_replicon::{prelude::*, shared::replicon_tick::RepliconTick};
 use serde::{Deserialize, Serialize};
 
-/// The source of the current simulation tick
 pub trait TickSource: Resource + Copy + From<RepliconTick> + Into<RepliconTick> {}
 
 impl<T> TickSource for T where T: Resource + Copy + From<RepliconTick> + Into<RepliconTick> {}
 
-/// A plugin adding input queue logic to an app
 pub struct InputQueuePlugin<T: InputTrait, Tick: TickSource> {
     #[cfg_attr(not(any(feature = "client", feature = "server")), allow(dead_code))]
     schedule: Interned<dyn ScheduleLabel>,
@@ -38,7 +34,6 @@ pub struct InputQueuePlugin<T: InputTrait, Tick: TickSource> {
 }
 
 impl<T: InputTrait, Tick: TickSource> InputQueuePlugin<T, Tick> {
-    /// Construct an `InputQueuePlugin` from the schedule inputs should be loaded in
     pub fn new(schedule: impl ScheduleLabel) -> Self {
         Self {
             schedule: schedule.intern(),
@@ -64,25 +59,13 @@ impl<T: InputTrait, Tick: TickSource> Plugin for InputQueuePlugin<T, Tick> {
     }
 }
 
-/// A collection of system sets for input queue logic
 #[derive(SystemSet, Clone, PartialEq, Eq, Debug, Hash)]
 pub enum InputQueueSet {
-    /// A set with systems receiving/sending data.
-    /// Receiving happens in `PreUpdate`, sending in `PostUpdate`
     Network,
-    /// A set that loads inputs to the T registered on [`InputQueuePlugin`]
     Load,
-    /// A set that stores and clears inputs
     Clean,
 }
 
-/// A trait for an Input that can be registered via [`InputQueuePlugin`]
-///
-/// The `PartialEq` bound exists so [`InputQueue::add`] can decide whether an
-/// incoming past-tick history entry is value-novel (different from what's
-/// already on file for that tick) vs a duplicate resend. Without this, every
-/// per-tick history broadcast from the client would trigger a fresh rollback
-/// request on the server even when no input actually changed.
 pub trait InputTrait:
     Component<Mutability = Mutable>
     + Sync
@@ -97,40 +80,16 @@ pub trait InputTrait:
     + TypePath
     + Default
 {
-    /// Whether or not the input repeats
     fn repeats() -> bool;
 
-    /// Get a repeated copy of this input for use when no exact-tick input is
-    /// available. When [`Self::repeats`] is `true`, the latest known input is
-    /// repeated *indefinitely* — this matches the "last input drives forever
-    /// until disconnect is detected" pattern most heavily-networked games use,
-    /// and is what client-side prediction needs to keep moving smoothly across
-    /// arbitrary network jitter without snapping to a `default()` fallback.
-    /// Implementors that want a hard cap can override this with their own
-    /// `since`-aware logic.
     fn repeated(&self, _since: u32) -> Option<Self> {
         Self::repeats().then(|| self.clone())
     }
 }
 
-/// A marker component for entities for which this client has authority to send inputs
 #[derive(Component, Default)]
 pub struct InputAuthority;
 
-/// The latest *confirmed* tick — the horizon beyond which a non-authority (remote)
-/// body's input is EXTRAPOLATED rather than taken from the queue, on the server.
-/// `load_inputs` loads a remote body's input at `min(sim_tick, confirmed)` instead of
-/// `sim_tick`: at or before the confirmed tick it uses the real queued input (so the
-/// authoritative reconstruction during resim stays correct), and beyond it (the lead
-/// window, `confirmed < sim_tick ≤ present`) it repeats the confirmed input — so the
-/// remote body extrapolates from the confirmed horizon to the present, symmetric with
-/// how a client extrapolates the host body it only has input for up to `present −
-/// one_way`. Reconciled by rollback when newer input lands.
-///
-/// Default [`u32::MAX`] → `min(sim_tick, confirmed) == sim_tick`, i.e. no
-/// extrapolation (the prior behaviour, and correct at zero latency where present ==
-/// confirmed). The host sets it to its `ServerTick`. Authority bodies ignore it (their
-/// queue is empty; they run from live input).
 #[derive(Resource, Debug, Clone, Copy)]
 pub struct ConfirmedHorizon(pub u32);
 
@@ -140,37 +99,14 @@ impl Default for ConfirmedHorizon {
     }
 }
 
-/// How many ticks below the confirmed horizon (`ServerTick`) the host will still
-/// roll back to apply a late client input — the input-pipeline depth (a client
-/// input for tick `T` is received and processed the frame after the host
-/// simulated `T`, so even at zero latency the eager path reaches one tick back)
-/// plus a small jitter margin.
-///
-/// An input stamped at or below `ConfirmedHorizon - SEAL_GRACE_TICKS` is *sealed*:
-/// the host has already simulated and replicated those ticks as authoritative, so
-/// rolling back to apply it would rewrite replicated history and re-ship a
-/// corrected value to every client (the asymmetric move→stop overshoot). The host
-/// instead **discards** such a too-late input — the standard server-authoritative
-/// dejitter policy. This bounds how far below the sealed tick the host may revise
-/// authoritative state to `SEAL_GRACE_TICKS`, regardless of ping; combined with a
-/// lead sized to cover the one-way trip (see `INPUT_HISTORY_CAPACITY`), inputs
-/// normally land *above* the horizon and the guard only fires on jitter outliers.
-/// Flagged for the on-device feel pass.
 pub const SEAL_GRACE_TICKS: u32 = 2;
 
-/// The server→client broadcast of a body's input around a stamp tick: a small
-/// window of already-consumed `past` inputs (redundancy against loss) plus the
-/// still-queued `future` inputs, each stored as an offset from `tick`.
 #[derive(Message, Clone, TypePath, Serialize, Deserialize, PartialEq, Eq, Debug)]
 #[serde(bound(deserialize = "T: for<'de2> serde::Deserialize<'de2>"))]
 pub struct HistoryFor<T: InputTrait> {
-    /// The body the inputs belong to.
     pub entity: Entity,
-    /// The stamp tick offsets are relative to.
     pub tick: RepliconTick,
-    /// Already-consumed inputs, as (offset below `tick`, input) pairs.
     pub past: ArrayVec<(u8, T), 3>,
-    /// Still-queued inputs, as (offset at/above `tick`, input) pairs.
     pub future: ArrayVec<(u8, T), 7>,
 }
 

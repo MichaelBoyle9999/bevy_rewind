@@ -1,5 +1,3 @@
-//! Tests for the server-side input systems (src/server.rs).
-
 #![cfg(feature = "server")]
 
 mod support;
@@ -53,7 +51,6 @@ fn receives_inputs() {
 
     app.update();
 
-    // We should not spawn new entities for the unknown clients
     assert_eq!(
         4,
         app.world_mut()
@@ -63,9 +60,6 @@ fn receives_inputs() {
     );
 
     let [e1, e2, e3, e4] = app.world().get_entity([e1, e2, e3, e4]).unwrap();
-    // e1's history starts at tick 4 (one tick in the past relative to
-    // cur_tick=5). Under the eager-rollback contract the past tick is
-    // accepted into the queue rather than dropped.
     assert_eq!(
         vec![
             &(Tick(4).into(), A(1)),
@@ -88,7 +82,6 @@ fn receives_inputs() {
             .queue()
             .collect::<Vec<_>>()
     );
-    // e3 got a message targeted for e4 because of InputTarget
     assert_eq!(
         vec![
             &(Tick(6).into(), A(1)),
@@ -100,22 +93,14 @@ fn receives_inputs() {
             .queue()
             .collect::<Vec<_>>()
     );
-    // e4 isn't the target itself and thus received nothing
     assert_eq!(0, e4.get::<InputQueue<A>>().unwrap().queue().count());
 
-    // The past-tick history from e1 (hist(4, ...)) should have requested a
-    // rollback to tick 4. The other two messages (hist(5,..) and hist(6,..))
-    // are at or in the future and don't request rollback.
     assert_eq!(
         Some(RepliconTick::new(4)),
         **app.world().resource::<RollbackTarget>()
     );
 }
 
-/// Multiple past-input messages in one frame collapse to the earliest tick
-/// via min, and an already-present (state-confirm-driven) rollback target
-/// is preserved when it's earlier than any incoming past input. This is
-/// the "compose with other rollback triggers" invariant of `receive_inputs`.
 #[test]
 fn receive_inputs_takes_min_with_existing_rollback_target() {
     let mut app = App::new();
@@ -128,9 +113,6 @@ fn receive_inputs_takes_min_with_existing_rollback_target() {
         .init_resource::<ConfirmedHorizon>()
         .insert_resource(Tick(20));
 
-    // Seed a pre-existing rollback target (as if a state confirm had already
-    // requested it). It is *earlier* than any incoming past input, so the
-    // min should preserve it.
     **app.world_mut().resource_mut::<RollbackTarget>() = Some(RepliconTick::new(7));
 
     app.world_mut().write_message_batch([FromClient {
@@ -146,8 +128,6 @@ fn receive_inputs_takes_min_with_existing_rollback_target() {
         "an earlier pre-existing target must not be raised by a later past input",
     );
 
-    // Now write a message whose past tick is earlier than the existing
-    // target — the min should lower the target to the new past tick.
     app.world_mut().write_message(FromClient {
         client_id: ClientId::Client(e_late),
         message: hist(3, [A(0), A(0), A(0), A(0)]),
@@ -161,10 +141,6 @@ fn receive_inputs_takes_min_with_existing_rollback_target() {
     );
 }
 
-/// A future-only input message (history fully at or after `cur_tick`)
-/// must not write to `RollbackTarget`. The eager-rollback path is
-/// strictly opt-in on past arrivals; future arrivals follow the legacy
-/// "queue and apply on tick advance" path.
 #[test]
 fn receive_inputs_does_not_request_rollback_for_future_input() {
     let mut app = App::new();
@@ -185,12 +161,6 @@ fn receive_inputs_does_not_request_rollback_for_future_input() {
     assert_eq!(None, **app.world().resource::<RollbackTarget>());
 }
 
-/// Seal guard: a client input stamped at or below the sealed horizon
-/// (`ConfirmedHorizon - SEAL_GRACE_TICKS`) is too late to revise authoritative
-/// state — the host has already simulated and replicated those ticks — so it must
-/// NOT request a rollback. Without the guard the host rewinds below its replicated
-/// `ServerTick` and re-ships a corrected value to every client, the asymmetric
-/// move→stop overshoot.
 #[test]
 fn receive_inputs_seals_too_late_input() {
     let mut app = App::new();
@@ -198,11 +168,9 @@ fn receive_inputs_seals_too_late_input() {
     app.add_message::<FromClient<InputHistory<A>>>()
         .add_systems(Update, receive_inputs::<A, Tick>)
         .init_resource::<RollbackTarget>()
-        // Horizon 10, grace 2 → sealed floor at tick 8.
         .insert_resource(ConfirmedHorizon(10))
         .insert_resource(Tick(15));
 
-    // Novel past tick 8 == 10 - SEAL_GRACE_TICKS(2): sealed, must be dropped.
     app.world_mut().write_message(FromClient {
         client_id: ClientId::Client(e),
         message: hist(8, [A(1)]),
@@ -216,9 +184,6 @@ fn receive_inputs_seals_too_late_input() {
     );
 }
 
-/// The complement: an input just *above* the sealed horizon lands in the host's
-/// unsealed lead window, so a genuinely-late but not-yet-replicated input must
-/// still request a rollback and be applied.
 #[test]
 fn receive_inputs_rolls_back_unsealed_input() {
     let mut app = App::new();
@@ -229,7 +194,6 @@ fn receive_inputs_rolls_back_unsealed_input() {
         .insert_resource(ConfirmedHorizon(10))
         .insert_resource(Tick(15));
 
-    // Novel past tick 9 > 8: unsealed, must roll back.
     app.world_mut().write_message(FromClient {
         client_id: ClientId::Client(e),
         message: hist(9, [A(1)]),
@@ -243,10 +207,6 @@ fn receive_inputs_rolls_back_unsealed_input() {
     );
 }
 
-/// With no seal published yet (`ConfirmedHorizon` at its `u32::MAX` default —
-/// e.g. before the host's first fixed step), the eager path is unguarded: even a
-/// deep past input rolls back, preserving the prior behaviour and the
-/// zero-latency depth-1 rollback.
 #[test]
 fn receive_inputs_unsealed_when_horizon_unset() {
     let mut app = App::new();
@@ -319,42 +279,28 @@ fn loads_inputs_with_queue() {
 
     app.update();
 
-    // These is input so it should be used
     let e = app.world().entity(e1);
     assert_eq!(A(1), *e.get::<A>().unwrap());
-    // There is no input for this tick so this entity goes back to default
     let e = app.world().entity(e2);
     assert_eq!(A(0), *e.get::<A>().unwrap());
 
     app.insert_resource(Tick(6));
     app.update();
 
-    // We load the next input
     let e = app.world().entity(e1);
     assert_eq!(A(2), *e.get::<A>().unwrap());
-    // This entity has input now
     let e = app.world().entity(e2);
     assert_eq!(A(1), *e.get::<A>().unwrap());
 
     app.insert_resource(Tick(7));
     app.update();
 
-    // We repeat an old input
     let e = app.world().entity(e1);
     assert_eq!(A(2), *e.get::<A>().unwrap());
-    // This entity has a new input
     let e = app.world().entity(e2);
     assert_eq!(A(2), *e.get::<A>().unwrap());
 }
 
-/// A remote (non-authority) body whose queue holds input both at the confirmed
-/// horizon and ahead of it (the present) must load the CONFIRMED-tick input — so
-/// it extrapolates the present from the confirmed horizon — while an authority
-/// body ignores the horizon and replays at the simulated tick (its own input is
-/// confirmed by definition). Run under `Resimulating` because that is when an
-/// authority body loads at all: during forward simulation its live input is
-/// authoritative and never overwritten. This is what makes the host's render of
-/// a remote body extrapolate symmetrically with the client's.
 #[test]
 fn remote_body_loads_at_confirmed_horizon_authority_loads_at_present() {
     let mut app = App::new();
@@ -363,13 +309,10 @@ fn remote_body_loads_at_confirmed_horizon_authority_loads_at_present() {
         .insert_resource(Resimulating)
         .insert_resource(Tick(7));
 
-    // Remote body: queue holds ticks 5 (A(10), confirmed), 6, 7 (A(30), present).
     let mut queue = InputQueue::<A>::default();
     queue.add(Tick(7), &hist(5, [A(10), A(20), A(30)]));
     let remote = app.world_mut().spawn((A(0), queue)).id();
 
-    // Authority body: same record in its own history; it replays at the
-    // simulated tick regardless of the horizon.
     let own = app
         .world_mut()
         .spawn((
@@ -382,16 +325,10 @@ fn remote_body_loads_at_confirmed_horizon_authority_loads_at_present() {
 
     app.update();
 
-    // Remote clamps to `min(present 7, confirmed 5) = 5` → tick 5's input.
     assert_eq!(A(10), *app.world().entity(remote).get::<A>().unwrap());
-    // Authority replays the simulated tick 7's input.
     assert_eq!(A(30), *app.world().entity(own).get::<A>().unwrap());
 }
 
-/// During forward simulation an authority body's live input must never be
-/// overwritten by the load — the per-tick capture is the source of truth —
-/// but its own tick is still consumed from the self-fed queue so the
-/// consumed ring (`InputQueue::past`) carries the broadcast redundancy.
 #[test]
 fn authority_forward_load_keeps_live_input_and_consumes_queue() {
     let mut app = App::new();
@@ -408,10 +345,7 @@ fn authority_forward_load_keeps_live_input_and_consumes_queue() {
 
     app.update();
 
-    // Live input untouched (the queued A(9) would have clobbered the
-    // captured A(42) under the old unconditional assignment)...
     assert_eq!(A(42), *app.world().entity(own).get::<A>().unwrap());
-    // ...but the tick was consumed into the redundancy ring.
     assert_eq!(
         vec![&(Tick(5).into(), A(9))],
         app.world()
@@ -423,14 +357,6 @@ fn authority_forward_load_keeps_live_input_and_consumes_queue() {
     );
 }
 
-/// The listen-server loopback: an `InputAuthority` body's live input is
-/// recorded into its own history and fed through `InputQueue::add` — the same
-/// entry point a client's `FromClient` message feeds — and `send_inputs` then
-/// broadcasts it with the same consumed-ring redundancy a client body gets.
-/// Three stored+consumed ticks must broadcast as three `past` entries, so a
-/// client can lose up to two consecutive messages without a gap. This replaces
-/// the former special case that sent the live input as a single, unprotected
-/// `future` entry (one lost datagram = one permanently corrupted tick).
 #[test]
 fn authority_body_self_feeds_and_broadcasts_with_redundancy() {
     let mut app = App::new();
@@ -480,9 +406,6 @@ fn authority_body_self_feeds_and_broadcasts_with_redundancy() {
     assert!(messages.next().is_none());
 }
 
-/// The self-feed must not run during a rollback resim: the recorded history is
-/// what the resim replays, and re-recording the live `T` mid-resim would
-/// corrupt it at the resimulated tick.
 #[test]
 fn self_feed_is_inert_during_resim() {
     let mut app = App::new();
@@ -510,9 +433,6 @@ fn self_feed_is_inert_during_resim() {
     );
 }
 
-/// A body whose queue has never been fed broadcasts nothing — an empty
-/// `HistoryFor` would be pure traffic and the client-side receive would do
-/// nothing with it.
 #[test]
 fn send_inputs_skips_unfed_queue() {
     let mut app = App::new();
@@ -547,7 +467,6 @@ fn clears_inputs_empty_queue() {
 
     app.update();
 
-    // There is no history, so the input is cleared
     let e = app.world().entity(e1);
     assert_eq!(A(0), *e.get::<A>().unwrap());
 }
@@ -612,20 +531,13 @@ fn repeat_late_inputs() {
 
     app.update();
 
-    // All the data was old, but they could still be repeated
     let e = app.world().entity(e1);
     assert_eq!(A(2), *e.get::<A>().unwrap());
 
-    // The latest known input is repeated indefinitely (the former 5-tick
-    // cap was dropped because it produced default()-fallback prediction
-    // bugs under any jitter).
     let e = app.world().entity(e2);
     assert_eq!(A(1), *e.get::<A>().unwrap());
 }
 
-/// Messages the routing cannot place — the listen server's own loopback id
-/// (which never ships `FromClient` messages) and a client entity with no
-/// `InputQueue` — are skipped, and later messages in the batch still apply.
 #[test]
 fn receive_inputs_skips_unroutable_messages() {
     let mut app = App::new();
@@ -672,10 +584,6 @@ fn receive_inputs_skips_unroutable_messages() {
     );
 }
 
-/// `publish_confirmed_input_horizon` mirrors each queue's received-input
-/// horizon onto a `ConfirmedInputHorizon` component: an unfed queue publishes
-/// nothing, the first received input inserts the component, and an unchanged
-/// horizon is not re-inserted (no replication churn).
 #[test]
 fn publishes_confirmed_input_horizon_once_per_change() {
     let mut app = App::new();
@@ -734,9 +642,6 @@ fn publishes_confirmed_input_horizon_once_per_change() {
     );
 }
 
-/// `store_authority_inputs` on a history stamped ahead of the current tick
-/// resets the stale record, re-records from the live input, and self-feeds the
-/// queue at the current tick.
 #[test]
 fn store_authority_inputs_resets_history_recorded_in_the_future() {
     let mut app = App::new();
@@ -771,8 +676,6 @@ fn store_authority_inputs_resets_history_recorded_in_the_future() {
     );
 }
 
-/// The self-feed must be idempotent within a tick: a history already updated
-/// at the current tick is left alone and nothing is re-fed into the queue.
 #[test]
 fn store_authority_inputs_skips_already_recorded_tick() {
     let mut app = App::new();
@@ -803,9 +706,6 @@ fn store_authority_inputs_skips_already_recorded_tick() {
     );
 }
 
-/// A queue whose consumed ring claims ticks from the future (the tick source
-/// moved backwards underneath it — an invariant violation) is warned about and
-/// skipped: broadcasting it would compute negative past offsets.
 #[test]
 fn send_inputs_skips_queue_with_future_consumed_ticks() {
     let mut app = App::new();
@@ -813,8 +713,6 @@ fn send_inputs_skips_queue_with_future_consumed_ticks() {
         .add_systems(Update, send_inputs::<A, Tick>)
         .insert_resource(Tick(5));
 
-    // Two corrupt bodies: the warn fires for the first and takes its
-    // already-warned arm for the second.
     for _ in 0..2 {
         let mut queue = InputQueue::<A>::default();
         queue.add(Tick(10), &hist(10, [A(1)]));
@@ -834,8 +732,6 @@ fn send_inputs_skips_queue_with_future_consumed_ticks() {
     );
 }
 
-/// An authority body resimulating a tick its history has no record for keeps
-/// its live input — the replay must never zero a body over a missing record.
 #[test]
 fn authority_resim_missing_history_keeps_live_input() {
     let mut app = App::new();

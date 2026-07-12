@@ -1,9 +1,3 @@
-//! Lifecycle coverage for the `Unspawned`/`Despawned` disable-and-reenable
-//! machinery: the shared `reenable` hook only drops `Disabled` once *both*
-//! lifecycle markers are gone, entities that never re-reach their spawn tick
-//! are despawned at `BackToPresent`, and a `PreRollback` pass without a target
-//! marks nothing.
-
 #[path = "support/app.rs"]
 mod app;
 #[path = "support/tick.rs"]
@@ -23,7 +17,6 @@ fn pre_rollback_without_target_marks_nothing() {
     let e = app.world_mut().spawn(Predicted).id();
     app.update();
 
-    // Run PreRollback directly with no rollback target requested.
     assert!(app.world().resource::<RollbackTarget>().is_none());
     app.world_mut().run_schedule(RollbackSchedule::PreRollback);
     app.world_mut().flush();
@@ -36,9 +29,6 @@ fn pre_rollback_without_target_marks_nothing() {
 
 #[test]
 fn entity_spawned_after_present_is_despawned_at_back_to_present() {
-    // SpawnedAt(20) with present tick 15: resim never crosses the spawn tick,
-    // so the entity stays Unspawned through the whole rollback and must be
-    // despawned by `BackToPresent`.
     let mut app = init_app(15);
     let e = app.world_mut().spawn(Predicted).id();
     app.update();
@@ -90,7 +80,6 @@ fn removing_despawned_keeps_disabled_while_unspawned_remains() {
         "Disabled must be retained while the entity is still Unspawned"
     );
 
-    // Dropping the last marker re-enables the entity.
     world.entity_mut(e).remove::<Unspawned>();
     world.flush();
     assert!(
@@ -117,10 +106,6 @@ fn removing_sole_despawned_marker_reenables() {
 }
 
 proptest! {
-    /// After a rollback to `target`, an entity stamped `SpawnedAt(spawn)` must
-    /// survive (re-enabled) exactly when its spawn tick is at or before the
-    /// present tick; later stamps never re-enable and are culled at
-    /// `BackToPresent`.
     #[test]
     fn rollback_preserves_entities_spawned_at_or_before_present(
         spawn in 0u32..=30,

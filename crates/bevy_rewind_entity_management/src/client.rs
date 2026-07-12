@@ -15,7 +15,6 @@ use bevy_rewind::{
     StoreScheduleLabel, TickSource,
 };
 
-/// A plugin adding rollback-friendly entity management to the app.
 pub struct EntityManagementPlugin<Tick: TickSource>(PhantomData<Tick>);
 
 impl<Tick: TickSource> Default for EntityManagementPlugin<Tick> {
@@ -25,7 +24,6 @@ impl<Tick: TickSource> Default for EntityManagementPlugin<Tick> {
 }
 
 impl<Tick: TickSource> EntityManagementPlugin<Tick> {
-    /// Construct the `EntityManagementPlugin`
     pub fn new() -> Self {
         Self(PhantomData)
     }
@@ -33,9 +31,8 @@ impl<Tick: TickSource> EntityManagementPlugin<Tick> {
 
 impl<Tick: TickSource> Plugin for EntityManagementPlugin<Tick> {
     fn build(&self, app: &mut App) {
-        // `reenable` (the on_remove hook for both `Despawned` and `Unspawned`)
-        // looks up both components by id and unwraps; force-register them here so
-        // the hook works even before any entity has either marker inserted.
+        // `reenable` looks up both component ids and unwraps; force-register so
+        // the hook works before any entity carries either marker.
         app.world_mut().register_component::<Despawned>();
         app.world_mut().register_component::<Unspawned>();
 
@@ -66,9 +63,6 @@ impl<Tick: TickSource> Plugin for EntityManagementPlugin<Tick> {
     }
 }
 
-/// Stamp [`SpawnedAt`] onto a newly-added [`Predicted`] entity from the current
-/// tick source. Skips during a resim so a rollback-driven re-add does not
-/// overwrite the original tick.
 fn stamp_spawned_at<Tick: TickSource>(
     add: On<Add, Predicted>,
     mut commands: Commands,
@@ -87,16 +81,9 @@ fn stamp_spawned_at<Tick: TickSource>(
     commands.entity(entity).insert(SpawnedAt(cur));
 }
 
-/// Just-before-rollback: mark every [`Predicted`] entity whose [`SpawnedAt`] is
-/// strictly after the rollback target as [`Unspawned`], which `#[require]`s
-/// [`Disabled`]. The disable lands before `bevy_rewind`'s
-/// `load_and_clear_prediction` runs in `RollbackSchedule::Rollback` (commands
-/// flush between schedules), so its `if !is_disabled` guards skip these entities
-/// and the `(Missing, Missing)` arm cannot strip their components. The entity is
-/// then naturally re-enabled by [`reenable_at_spawn_tick`] when forward resim
-/// crosses its spawn tick. We skip entities that are already [`Disabled`] for
-/// any other reason (typically [`Despawned`] lifecycle) so we don't entangle
-/// with that flow.
+// The disable must land before `bevy_rewind`'s `load_and_clear_prediction`
+// (`RollbackSchedule::Rollback`) so its disabled-guards skip these entities;
+// commands flush between schedules guarantees the ordering.
 fn disable_unspawned_during_rollback(
     mut commands: Commands,
     q: Query<(Entity, &SpawnedAt), (With<Predicted>, Without<Disabled>)>,
@@ -113,16 +100,6 @@ fn disable_unspawned_during_rollback(
     }
 }
 
-/// Per-resim-tick: remove [`Unspawned`] from entities whose [`SpawnedAt`] tick
-/// has been reached by forward resim. The component's `on_remove = reenable`
-/// hook drops [`Disabled`] in the same flush so the entity participates in the
-/// simulation schedule for that tick onward. Runs in `RollbackSchedule::PreResimulation`,
-/// before the user-registered simulation schedule but after the per-iter `Tick`
-/// resource has been written by `trigger_rollback`.
-///
-/// Disabled entities are filtered out of normal queries; the
-/// `Or<(With<Disabled>, Without<Disabled>)>` predicate opts back in so we can
-/// see them.
 fn reenable_at_spawn_tick<Tick: TickSource>(
     mut commands: Commands,
     q: Query<(Entity, &SpawnedAt), (With<Unspawned>, Or<(With<Disabled>, Without<Disabled>)>)>,
@@ -174,7 +151,6 @@ fn disable_server_despawned_entities<Tick: TickSource>(
 #[derive(Resource)]
 struct GetTickDeferred(fn(&DeferredWorld) -> RepliconTick);
 
-/// A marker for entities that should be despawned once they fall out of history
 #[derive(Component, Clone, Copy)]
 #[component(on_insert=track_unused)]
 #[component(on_remove=untrack_unused)]
@@ -205,15 +181,11 @@ fn reenable(mut world: DeferredWorld, ctx: HookContext) {
     world.commands().entity(ctx.entity).try_remove::<Disabled>();
 }
 
-/// A marker for entities that have been rolled back to before they spawned.
-/// These entities are despawned if they aren't re-enabled before [`RollbackSchedule::BackToPresent`]
 #[derive(Component)]
 #[component(on_remove = reenable)]
 #[require(Disabled)]
 pub struct Unspawned;
 
-/// A component tracking when an entity became unused, it will be despawned once this tick is
-/// outside of the history range.
 #[derive(Component, Deref, Default)]
 struct UnusedAt(RepliconTick);
 

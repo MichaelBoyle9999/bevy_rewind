@@ -1,5 +1,3 @@
-//! Tests for `InputHistory` (src/history.rs).
-
 #[path = "support/entity_input.rs"]
 mod entity_input;
 mod support;
@@ -21,7 +19,6 @@ fn get() {
         assert_eq!(Some(A(1 + i)), history.get(Tick(10 + i as u32), false));
     }
 
-    // All values outside of the history should return None
     assert_eq!(None, history.get(Tick(9), false));
     assert_eq!(None, history.get(Tick(0), false));
     assert_eq!(None, history.get(Tick(5), false));
@@ -34,11 +31,6 @@ fn get() {
 fn get_repeats() {
     let history = hist(0, [A(1)]);
 
-    // For a repeating input, the latest known value is returned for any
-    // future tick — no hard cap. This is the "last input drives forever
-    // until disconnect" pattern; the dropped cap removes a former tight
-    // 5-tick window that snapped client prediction to default() under
-    // any network jitter.
     for i in 0..5 {
         assert_eq!(Some(A(1)), history.get(Tick(i as u32), true));
     }
@@ -58,22 +50,16 @@ fn write() {
     assert_eq!(2, history.list.len());
     assert_eq!(RepliconTick::new(16), history.updated_at());
 
-    // Writes in the past get ignored
     history.write(Tick(14), A(0));
     assert_eq!(2, history.list.len());
     assert_eq!(RepliconTick::new(16), history.updated_at());
 
-    // When there's a gap, the history is patched up by repeating the last
-    // known input across the missing ticks (the body "kept doing what it
-    // was doing"), not by planting defaults.
     history.write(Tick(20), A(6));
     assert_eq!(6, history.list.len());
     assert_eq!(RepliconTick::new(20), history.updated_at());
 
     assert_eq!(hist(15, [A(1), A(2), A(2), A(2), A(2), A(6)]), history);
 
-    // When the gap exceeds capacity, the old history is cleared. Gap must
-    // exceed `INPUT_HISTORY_CAPACITY` (25), so write at tick 46 (gap 26).
     history.write(Tick(46), A(10));
     assert_eq!(1, history.list.len());
 }
@@ -85,7 +71,6 @@ fn write_with_gaps_wrap() {
 
     history.write(Tick(25), A(15));
     assert_eq!(10, history.list.len());
-    // The five-tick gap (20..=24) repeats the last known input A(9).
     assert_eq!(
         hist(
             16,
