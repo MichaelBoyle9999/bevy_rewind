@@ -7,25 +7,17 @@ use core::{num::NonZero, ptr::NonNull};
 
 use bevy::ptr::{OwningPtr, Ptr, PtrMut};
 
-/// A blobby ring buffer with support for gaps
 pub struct BlobDeque {
-    /// The memory layout of each item
     layout: Layout,
-    /// Capacity in items, not bytes
     pub capacity: u8,
-    /// The length in items, not bytes
     pub len: u8,
-    /// The start of the ringbuffer in items, not bytes
     pub start: u8,
-    /// The ring buffer's data
     pub data: NonNull<u8>,
-    /// The function to drop items, if any
     drop: Option<unsafe fn(OwningPtr<'_>)>,
 }
 
 impl core::fmt::Debug for BlobDeque {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // Writing to a `String` is infallible, so build the item list eagerly.
         let mut items = String::new();
         items.push('[');
 
@@ -85,7 +77,6 @@ impl BlobDeque {
         }
     }
 
-    /// Get the length of the `BlobDeque`
     #[expect(
         clippy::len_without_is_empty,
         reason = "no consumer needs is_empty; adding it would be untested dead code"
@@ -94,7 +85,6 @@ impl BlobDeque {
         self.len as usize
     }
 
-    /// Get the capacity of the `BlobDeque`
     pub fn capacity(&self) -> usize {
         self.capacity as usize
     }
@@ -118,7 +108,6 @@ impl BlobDeque {
     pub fn get_mut<'a>(&'a mut self, index: usize) -> Option<PtrMut<'a>> {
         let size = self.layout.size();
         if size == 0 || (self.len as usize) < index + 1 {
-            // size 0 cannot be mutated
             return None;
         }
         let offset = self.get_offset(index);
@@ -155,8 +144,6 @@ impl BlobDeque {
         self.len -= 1;
     }
 
-    /// Append a value to the back, dropping the front if at capacity
-    ///
     /// # Safety
     /// - The value written in `write_fn` MUST match the type the `BlobDeque` was made for
     /// - `write_fn` MUST write to the [`PtrMut`], or the value will be uninitialized
@@ -183,12 +170,9 @@ impl BlobDeque {
         Some(unsafe { PtrMut::new(self.data).byte_add(offset) })
     }
 
-    /// Insert a value at `at`, shifting later items back
-    ///
     /// # Safety
     /// - The value written in `write_fn` MUST match the type the `BlobDeque` was made for
     /// - `write_fn` MUST write to the [`PtrMut`], or the value will be uninitialized
-    // TODO: Return capacity error instead of Option
     #[must_use]
     pub unsafe fn insert<'a>(
         &mut self,
@@ -217,7 +201,6 @@ impl BlobDeque {
         }
 
         if at == self.len() {
-            // No op
         } else if at == 0 {
             if self.start == 0 {
                 self.start = self.capacity - 1;
@@ -226,7 +209,6 @@ impl BlobDeque {
             }
         } else {
             if self.capacity - self.len < self.start {
-                // Shift the wrapped part of the buffer forward by one item
                 let first_half = (self.capacity - self.start) as usize;
 
                 let raw_pos = at.saturating_sub(first_half);
@@ -242,7 +224,6 @@ impl BlobDeque {
 
             if self.start as usize + at < self.capacity() {
                 if self.start != 0 && self.capacity - self.len <= self.start {
-                    // Move the item at the end to the front of the memory (before start)
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             self.data.byte_add((self.capacity() - 1) * size).as_ptr(),
@@ -375,7 +356,6 @@ pub fn array_layout(layout: &Layout, n: usize) -> Option<Layout> {
     Some(array_layout)
 }
 
-// TODO: replace with `Layout::repeat` if/when it stabilizes
 /// From <https://doc.rust-lang.org/beta/src/core/alloc/layout.rs.html>
 fn repeat_layout(layout: &Layout, n: usize) -> Option<(Layout, usize)> {
     // This cannot overflow. Quoting from the invariant of Layout:
@@ -398,25 +378,6 @@ fn repeat_layout(layout: &Layout, n: usize) -> Option<(Layout, usize)> {
 /// From <https://doc.rust-lang.org/beta/src/core/alloc/layout.rs.html>
 const fn padding_needed_for(layout: &Layout, align: usize) -> usize {
     let len = layout.size();
-
-    // Rounded up value is:
-    //   len_rounded_up = (len + align - 1) & !(align - 1);
-    // and then we return the padding difference: `len_rounded_up - len`.
-    //
-    // We use modular arithmetic throughout:
-    //
-    // 1. align is guaranteed to be > 0, so align - 1 is always
-    //    valid.
-    //
-    // 2. `len + align - 1` can overflow by at most `align - 1`,
-    //    so the &-mask with `!(align - 1)` will ensure that in the
-    //    case of overflow, `len_rounded_up` will itself be 0.
-    //    Thus the returned padding, when added to `len`, yields 0,
-    //    which trivially satisfies the alignment `align`.
-    //
-    // (Of course, attempts to allocate blocks of memory whose
-    // size and padding overflow in the above manner should cause
-    // the allocator to yield an error anyway.)
 
     let len_rounded_up = len.wrapping_add(align).wrapping_sub(1) & !align.wrapping_sub(1);
     len_rounded_up.wrapping_sub(len)

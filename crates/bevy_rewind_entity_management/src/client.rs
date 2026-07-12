@@ -31,8 +31,6 @@ impl<Tick: TickSource> EntityManagementPlugin<Tick> {
 
 impl<Tick: TickSource> Plugin for EntityManagementPlugin<Tick> {
     fn build(&self, app: &mut App) {
-        // `reenable` looks up both component ids and unwraps; force-register so
-        // the hook works before any entity carries either marker.
         app.world_mut().register_component::<Despawned>();
         app.world_mut().register_component::<Unspawned>();
 
@@ -81,9 +79,8 @@ fn stamp_spawned_at<Tick: TickSource>(
     commands.entity(entity).insert(SpawnedAt(cur));
 }
 
-// The disable must land before `bevy_rewind`'s `load_and_clear_prediction`
-// (`RollbackSchedule::Rollback`) so its disabled-guards skip these entities;
-// commands flush between schedules guarantees the ordering.
+// Must disable before bevy_rewind's `load_and_clear_prediction`
+// (`RollbackSchedule::Rollback`) so its disabled-guards skip these entities.
 fn disable_unspawned_during_rollback(
     mut commands: Commands,
     q: Query<(Entity, &SpawnedAt), (With<Predicted>, Without<Disabled>)>,

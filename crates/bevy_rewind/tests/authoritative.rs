@@ -1,5 +1,3 @@
-//! Tests for authoritative history writes (`src/history/authoritative.rs`).
-
 #[path = "support/comp_a.rs"]
 mod comp_a;
 #[path = "support/drops.rs"]
@@ -59,23 +57,19 @@ fn write_changes() {
     let e1 = world.spawn(AuthoritativeHistory::default()).id();
     let e2 = world.spawn(AuthoritativeHistory::default()).id();
 
-    // Write A(1) to e1 for tick 0
     world.entity_scope(e1, |e| {
         write_history_internal::<A>(comp_a, e, r_tick(0), A(1), frames);
     });
 
-    // Write A(5) to e2 for tick 1
     world.entity_scope(e2, |e| {
         write_history_internal::<A>(comp_a, e, r_tick(1), A(5), frames);
     });
 
-    // Write A(2) and A(3) to e1 for tick 1 and 3 respectively
     world.entity_scope(e1, |e| {
         write_history_internal::<A>(comp_a, e, r_tick(1), A(2), frames);
         write_history_internal::<A>(comp_a, e, r_tick(3), A(3), frames);
     });
 
-    // Write A(7) to e2 for tick 2
     world.entity_scope(e2, |e| {
         write_history_internal::<A>(comp_a, e, r_tick(2), A(7), frames);
     });
@@ -97,39 +91,6 @@ fn write_changes() {
     }
 }
 
-// TODO: Figure out deduplication of values
-// #[test]
-// fn write_duplicate() {
-//     let mut world = World::new();
-//     world.insert_resource(RollbackFrames::new(TEST_ROLLBACK_FRAMES));
-//     let mut registry = RollbackRegistry::default();
-//     registry.register::<A>(&mut world);
-//     world.insert_resource(registry);
-//     let e1 = world.spawn(AuthoritativeHistory::default()).id();
-
-//     // Write A(1) to e1 for tick 0
-//     let (mut commands, mut entity_mut) = commands_and_entity(&mut world, &mut queue, e1);
-//     write_history_internal::<A>(&mut commands, &mut entity_mut, r_tick(0), A(1));
-
-//     // Write A(1) to e1 for tick 2 and 4
-//     let (mut commands, mut entity_mut) = commands_and_entity(&mut world, &mut queue, e1);
-//     write_history_internal::<A>(&mut commands, &mut entity_mut, r_tick(2), A(1));
-//     write_history_internal::<A>(&mut commands, &mut entity_mut, r_tick(4), A(1));
-
-//     // Write A(1) to e1 for tick 3
-//     let (mut commands, mut entity_mut) = commands_and_entity(&mut world, &mut queue, e1);
-//     write_history_internal::<A>(&mut commands, &mut entity_mut, r_tick(3), A(1));
-
-//     use Missing as M;
-
-//     let e = world.entity(e1);
-//     let hist = e.get::<AuthoritativeHistory>().unwrap();
-//     assert!(hist.contains_key(&comp_a));
-//     for (i, v) in [a(1), M, M, M, M].iter_enumerate() {
-//         assert_eq!(v, hist.get(&comp_a).unwrap().get(i as u32).deref().cloned());
-//     }
-// }
-
 #[test]
 fn write_out_of_order() {
     let mut world = World::new();
@@ -144,14 +105,11 @@ fn write_out_of_order() {
     let e1 = world.spawn(AuthoritativeHistory::default()).id();
 
     world.entity_scope(e1, |e| {
-        // Write A(2) for tick 1
         write_history_internal::<A>(comp_a, e, r_tick(1), A(2), frames);
 
-        // Write A(4) and A(1) for tick 3 and 0 respectively
         write_history_internal::<A>(comp_a, e, r_tick(3), A(4), frames);
         write_history_internal::<A>(comp_a, e, r_tick(0), A(1), frames);
 
-        // Write A(3) for tick 2
         write_history_internal::<A>(comp_a, e, r_tick(2), A(3), frames);
     });
 
@@ -178,7 +136,6 @@ fn multiple_adds() {
 
     let e1 = world.spawn(AuthoritativeHistory::default()).id();
 
-    // Write A(1), A(2), and A(3) to e1 for tick 0, 1 and 3 respectively
     world.entity_scope(e1, |e| {
         write_history_internal::<A>(comp_a, e, r_tick(0), A(1), frames);
         write_history_internal::<A>(comp_a, e, r_tick(1), A(2), frames);
@@ -210,7 +167,6 @@ fn drop_once_on_success() {
 
     let drops = DropList::default();
 
-    // Write D(1) to e1 for tick 0
     world.entity_scope(e1, |e| {
         write_history_internal(comp_d, e, r_tick(0), D::new(1, &drops), frames);
         write_history_internal(comp_d, e, r_tick(1), D::new(2, &drops), frames);
@@ -241,7 +197,6 @@ fn drop_once_on_fail() {
 
     let drops = DropList::default();
 
-    // Write D(1) to e1 for tick 0
     world.entity_scope(e1, |e| {
         write_history_internal(comp_d, e, r_tick(10), D::new(1, &drops), frames);
         write_history_internal(comp_d, e, r_tick(10), D::new(2, &drops), frames);
@@ -273,7 +228,6 @@ fn write_to_unpredicted_entity_is_ignored() {
     world.insert_resource(registry);
     let comp_a = world.register_component::<A>();
 
-    // An entity with neither AuthoritativeHistory nor Predicted is left alone.
     let e1 = world.spawn_empty().id();
     world.entity_scope(e1, |e| {
         write_history_internal::<A>(comp_a, e, r_tick(0), A(1), frames);
@@ -293,7 +247,6 @@ fn write_to_predicted_missing_history_is_ignored() {
     world.insert_resource(registry);
     let comp_a = world.register_component::<A>();
 
-    // A Predicted entity whose AuthoritativeHistory has been stripped.
     let e1 = world.spawn(Predicted).id();
     world.entity_mut(e1).remove::<AuthoritativeHistory>();
     world.entity_scope(e1, |e| {

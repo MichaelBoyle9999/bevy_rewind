@@ -1,5 +1,3 @@
-//! Tests for the client-side input systems (src/client.rs).
-
 #![cfg(feature = "client")]
 
 mod support;
@@ -32,17 +30,10 @@ fn stores_inputs_with_authority() {
 
     app.update();
 
-    // Entities with InputAuthority should have history written
     let e = app.world().entity(e1);
     assert_eq!(hist(5, [A(4)]), *e.get::<InputHistory<A>>().unwrap());
-    // ... and the live component must survive the store untouched: it is a
-    // snapshot the capture rewrites, and fields the capture only writes
-    // conditionally (press counters, slewed axes) carry their value across
-    // ticks. A `mem::take` here once reverted a press counter to default
-    // the tick after a press — a phantom edge downstream.
     assert_eq!(A(4), *e.get::<A>().unwrap());
 
-    // Entities without should not
     let e = app.world().entity(e2);
     assert_eq!(hist(0, []), *e.get::<InputHistory<A>>().unwrap());
 }
@@ -56,8 +47,6 @@ fn sends_inputs_with_authority() {
     app.world_mut().spawn((hist(5, [A(2)]), InputAuthority));
     app.world_mut().spawn(hist(5, [A(1)]));
     app.world_mut().spawn(hist::<A>(0, []));
-    // An authority body whose history has never been fed (e.g. before its
-    // first stored step) has nothing to ship.
     app.world_mut().spawn((hist::<A>(0, []), InputAuthority));
 
     app.update();
@@ -66,9 +55,7 @@ fn sends_inputs_with_authority() {
         .world()
         .resource::<Messages<InputHistory<A>>>()
         .iter_current_update_messages();
-    // An update was sent for the entity with authority
     assert_eq!(Some(&hist(5, [A(2)])), messages.next());
-    // But not for other entities
     assert_eq!(None, messages.next());
 }
 
@@ -92,11 +79,9 @@ fn loads_inputs_without_authority() {
 
     app.update();
 
-    // Entities with InputAuthority should be untouched if the history is empty
     let e = app.world().entity(e1);
     assert_eq!(A(15), *e.get::<A>().unwrap());
 
-    // Entities with InputAuthority should load history
     let e = app.world().entity(e2);
     assert_eq!(A(2), *e.get::<A>().unwrap());
     let e = app.world().entity(e3);
@@ -122,35 +107,21 @@ fn receive_input_writes_history() {
 
     app.update();
 
-    // The target entity needs to have history written. The future gap at
-    // tick 6 (offsets 0 and 2 sent, 1 missing) repeats the last known input
-    // A(3) rather than defaulting.
     let actual = app.world().entity(e1).get::<InputHistory<A>>();
     let expected = hist(1, [A(1), A(1), A(1), A(2), A(3), A(3), A(4)]);
     assert_eq!(Some(&expected), actual);
 
-    // Other entities need to stay untouched
     let actual = app.world().entity(e2).get::<InputHistory<A>>();
     let expected = hist(0, []);
     assert_eq!(Some(&expected), actual);
 }
 
-/// The server's broadcast of a client's *own* body history is a stale echo:
-/// it can only repeat what the server has consumed, lagging the live record
-/// by the full round trip. Accepting it overwrites genuinely recorded inputs
-/// with the server's input-repeat (zeros over ticks still in flight) and
-/// requests a bogus rollback to the overwritten tick — the corruption loop
-/// that froze a driven body under bursty delivery (see
-/// `game/tests/netcode_invariants_proptest.rs`, Schedule band). An
-/// `InputAuthority` entity's history must be left untouched.
 #[test]
 fn receive_input_ignores_echo_for_own_authority_body() {
     let mut app = diverge_app(8);
-    // Locally recorded walk: ticks 2..=5 = A(1).
     let local = hist(2, [A(1), A(1), A(1), A(1)]);
     let e = app.world_mut().spawn((local.clone(), InputAuthority)).id();
 
-    // The server echoes its stale view: tick 4 = A(0) (it never saw the walk).
     app.world_mut().write_message(HistoryFor {
         entity: e,
         tick: Tick(4).into(),
@@ -173,9 +144,6 @@ fn receive_input_ignores_echo_for_own_authority_body() {
     );
 }
 
-/// Build a single-system app exercising the client `receive_inputs`
-/// misprediction trigger: a `Tick` source, a `RollbackTarget`, and a body
-/// whose `InputHistory` is the target of the broadcast.
 fn diverge_app(cur_tick: u32) -> App {
     let mut app = App::new();
     app.add_message::<HistoryFor<A>>()
@@ -185,20 +153,14 @@ fn diverge_app(cur_tick: u32) -> App {
     app
 }
 
-/// A broadcast input asserting a value at an already-extrapolated past tick
-/// that EQUALS what input-repeat predicted there must NOT request a rollback —
-/// the body did not mispredict. This is the novelty guard that keeps a remote
-/// body whose present runs ahead from rolling back every tick of a steady walk.
 #[test]
 fn receive_input_no_rollback_when_input_matches_prediction() {
     let mut app = diverge_app(8);
-    // Mirror extrapolated ticks 2..=5 = A(1) (the repeated walk input).
     let e = app
         .world_mut()
         .spawn(hist(2, [A(1), A(1), A(1), A(1)]))
         .id();
 
-    // Stamp 6 fills past tick 6 with A(1) — exactly the repeat. No correction.
     app.world_mut().write_message(HistoryFor {
         entity: e,
         tick: Tick(6).into(),
@@ -215,9 +177,6 @@ fn receive_input_no_rollback_when_input_matches_prediction() {
     );
 }
 
-/// The contrast: a broadcast input that DIFFERS from the repeated prediction
-/// at a past tick (the host's "stop" landing while we extrapolated the walk)
-/// is a real misprediction and must request a rollback to that tick.
 #[test]
 fn receive_input_requests_rollback_on_diverging_input() {
     let mut app = diverge_app(8);
@@ -226,7 +185,6 @@ fn receive_input_requests_rollback_on_diverging_input() {
         .spawn(hist(2, [A(1), A(1), A(1), A(1)]))
         .id();
 
-    // Stamp 6 fills past tick 6 with A(0) (stop) — diverges from the predicted A(1).
     app.world_mut().write_message(HistoryFor {
         entity: e,
         tick: Tick(6).into(),
@@ -243,29 +201,14 @@ fn receive_input_requests_rollback_on_diverging_input() {
     );
 }
 
-/// A lost broadcast must not plant `T::default()` in a remote body's history.
-///
-/// The server broadcasts an `InputAuthority` (listen-server host) body's input
-/// one tick per message with no redundancy (`server::send_inputs` pushes a
-/// single `future` entry), on the unreliable channel. When the message for one
-/// tick is lost — or the server's present skips a tick (a lead slew) — the next
-/// message's stamp arrives with a gap, and `InputHistory::write` fills the gap
-/// with `T::default()`. For a repeating input that is wrong twice over: the gap
-/// tick replays as a spurious zero input (a walking body halts and snaps its
-/// facing to default for one tick), and the documented "last input drives
-/// forever" extrapolation contract says the gap should repeat the last known
-/// input instead.
 #[test]
 fn receive_input_gap_from_lost_message_repeats_not_defaults() {
     let mut app = diverge_app(8);
-    // Steady walk received through tick 5.
     let e = app
         .world_mut()
         .spawn(hist(2, [A(1), A(1), A(1), A(1)]))
         .id();
 
-    // The tick-6 broadcast was lost; tick 7's arrives (single future entry,
-    // exactly the host-body broadcast shape).
     app.world_mut().write_message(HistoryFor {
         entity: e,
         tick: Tick(7).into(),
@@ -285,8 +228,6 @@ fn receive_input_gap_from_lost_message_repeats_not_defaults() {
     );
 }
 
-/// The misprediction target composes with an existing `RollbackTarget` via
-/// `min`: a pre-existing earlier target is preserved, a later one is lowered.
 #[test]
 fn receive_input_rollback_target_takes_min_with_existing() {
     let mut app = diverge_app(8);
@@ -295,7 +236,6 @@ fn receive_input_rollback_target_takes_min_with_existing() {
         .spawn(hist(2, [A(1), A(1), A(1), A(1)]))
         .id();
 
-    // Earlier pre-existing target wins over a later misprediction.
     **app.world_mut().resource_mut::<RollbackTarget>() = Some(RepliconTick::new(3));
     app.world_mut().write_message(HistoryFor {
         entity: e,
@@ -310,7 +250,6 @@ fn receive_input_rollback_target_takes_min_with_existing() {
         "an earlier pre-existing target must not be raised",
     );
 
-    // A later pre-existing target is lowered to the mispredicted tick.
     **app.world_mut().resource_mut::<RollbackTarget>() = Some(RepliconTick::new(10));
     app.world_mut().write_message(HistoryFor {
         entity: e,
@@ -326,9 +265,6 @@ fn receive_input_rollback_target_takes_min_with_existing() {
     );
 }
 
-/// `store_inputs` on a history stamped ahead of the current tick — the tick
-/// source landed below the recorded horizon (e.g. a tick-source reset) — must
-/// reset the stale record and re-record from the live input.
 #[test]
 fn store_inputs_resets_history_recorded_in_the_future() {
     let mut app = App::new();
@@ -348,9 +284,6 @@ fn store_inputs_resets_history_recorded_in_the_future() {
     );
 }
 
-/// `store_inputs` must be idempotent within a tick: a history already updated
-/// at the current tick is left untouched (the capture only records once per
-/// real simulation step).
 #[test]
 fn store_inputs_skips_already_recorded_tick() {
     let mut app = App::new();
@@ -370,10 +303,6 @@ fn store_inputs_skips_already_recorded_tick() {
     );
 }
 
-/// During a rollback resim the recorded history is the canonical input source:
-/// an authority body replays it, an authority body whose history misses the
-/// tick keeps its live input (never zeroed mid-resim), and a remote body with
-/// no record falls to the default.
 #[test]
 fn load_inputs_resim_replays_authority_history() {
     let mut app = App::new();
@@ -409,17 +338,12 @@ fn load_inputs_resim_replays_authority_history() {
     );
 }
 
-/// A broadcast for an entity that has no `InputHistory` (e.g. a body despawned
-/// locally while its input was in flight) warns and is skipped — later
-/// messages in the same batch must still be processed.
 #[test]
 fn receive_input_skips_entities_without_history() {
     let mut app = diverge_app(8);
     let missing = app.world_mut().spawn_empty().id();
     let tracked = app.world_mut().spawn(InputHistory::<A>::default()).id();
 
-    // Two messages for the un-tracked entity: the warn fires on the first and
-    // takes its already-warned arm on the second.
     for _ in 0..2 {
         app.world_mut().write_message(HistoryFor {
             entity: missing,

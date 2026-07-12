@@ -16,17 +16,17 @@ use bevy_rewind::{Predicted, RollbackFrames, RollbackPlugin};
 use bevy_rewind_entity_management::{Despawned, EntityManagementPlugin};
 use serde::{Deserialize, Serialize};
 
-// replicon gates entity-spawn emission on a non-withheld replicated component;
-// a bare `Replicated` entity would never be sent to the client.
+// replicon only emits an entity spawn for a non-withheld replicated component;
+// a bare `Replicated` entity is never sent to the client.
 #[derive(Component, Clone, Copy, Serialize, Deserialize)]
 struct Tagged;
 
 #[derive(ScheduleLabel, Clone, PartialEq, Eq, Debug, Hash)]
 struct StoreSched;
 
-// The plugin stack must be identical on both sides: `RollbackPlugin` calls
-// replicon's `track_mutate_messages`, which changes the replication wire
-// format, so an asymmetric install fails to parse the peer's messages.
+// Both sides must install the same stack: `RollbackPlugin` calls replicon's
+// `track_mutate_messages`, which changes the wire format, so an asymmetric
+// install can't parse the peer's messages.
 fn build_app(start_tick: u32) -> App {
     let mut app = App::new();
     app.add_plugins((

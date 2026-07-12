@@ -1,11 +1,7 @@
-//! An entity-carrying test input, for observing `MapEntities` behaviour.
-
 use bevy::{ecs::entity::MapEntities, prelude::*};
 use bevy_rewind_input::InputTrait;
 use serde::{Deserialize, Serialize};
 
-/// A repeating input that carries an [`Entity`], so entity mapping is
-/// observable (the plain `A` fixture's `map_entities` is a no-op).
 #[derive(Component, Clone, Serialize, Deserialize, Debug, PartialEq, TypePath)]
 pub struct E(pub Entity);
 

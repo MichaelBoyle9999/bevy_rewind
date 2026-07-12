@@ -1,5 +1,3 @@
-//! Tests for predicted resource histories (`src/predicted_resource.rs`).
-
 #[path = "support/sim_tick.rs"]
 mod sim_tick;
 
@@ -216,21 +214,17 @@ fn get() {
         last_tick: 6,
     };
 
-    // A valid tick within the history returns the value
     assert_eq!(&a(5), history.get(RepliconTick::new(3)));
     assert_eq!(&a(6), history.get(RepliconTick::new(4)));
     assert_eq!(&TickData::Removed, history.get(RepliconTick::new(5)));
     assert_eq!(&a(8), history.get(RepliconTick::new(6)));
 
-    // A tick before the history returns Missing
     assert_eq!(&Missing, history.get(RepliconTick::new(1)));
     assert_eq!(&Missing, history.get(RepliconTick::new(2)));
 
-    // A tick after the history returns Missing
     assert_eq!(&Missing, history.get(RepliconTick::new(7)));
     assert_eq!(&Missing, history.get(RepliconTick::new(2589)));
 
-    // If the oldest value is Removed, all ticks before it are considered Removed
     history.list[0] = TickData::Removed;
     assert_eq!(&TickData::Removed, history.get(RepliconTick::new(3)));
     assert_eq!(&TickData::Removed, history.get(RepliconTick::new(1)));
@@ -243,7 +237,6 @@ fn clean() {
         last_tick: 5,
     };
 
-    // A tick before the history clears everything
     for tick in [Tick(1), Tick(2)] {
         let mut history = original.clone();
         history.clean(tick.into());
@@ -251,7 +244,6 @@ fn clean() {
         assert_eq!(RepliconTick::from(tick).get(), history.last_tick);
     }
 
-    // A tick within the history cleans all values after it
     for tick in [Tick(3), Tick(4), Tick(5)] {
         let mut history = original.clone();
         history.clean(tick.into());
@@ -259,7 +251,6 @@ fn clean() {
         assert_eq!(RepliconTick::from(tick).get(), history.last_tick);
     }
 
-    // A tick after the history does nothing
     for tick in [Tick(6), Tick(2589)] {
         let mut history = original.clone();
         history.clean(tick.into());
@@ -282,7 +273,6 @@ fn keep_one() {
     assert_eq!(1, history.list.len());
     assert_eq!(3, history.last_tick);
 
-    // Calling it with one item should have no effect
     history.keep_one();
 
     assert_eq!(1, history.list.len());
@@ -296,7 +286,6 @@ fn keep_one_empty() {
         last_tick: 5,
     };
 
-    // This shouldn't panic or do anything weird
     history.keep_one();
     assert_eq!(0, history.len());
     assert_eq!(5, history.last_tick);
@@ -323,13 +312,11 @@ fn keep_one_doesnt_get_overridden() {
 
     **app.world_mut().resource_mut::<Tick>() -= 3;
 
-    // While the tick is old, the history should remain unchanged
     app.update();
     assert_lengths(&app, 1);
     app.update();
     assert_lengths(&app, 1);
 
-    // Values get written as normal again when the tick is back
     app.update();
     assert_lengths(&app, 2);
 
@@ -339,7 +326,6 @@ fn keep_one_doesnt_get_overridden() {
 
 #[test]
 fn rollback_frames_are_capped_at_60() {
-    // Requesting more than 60 frames warns and clamps.
     assert_eq!(60, RollbackFrames::new(61).max_frames());
     assert_eq!(5, RollbackFrames::new(5).max_frames());
 }
@@ -348,6 +334,5 @@ fn rollback_frames_are_capped_at_60() {
 #[should_panic(expected = "Tick source")]
 fn set_store_tick_requires_the_tick_resource() {
     let mut world = World::new();
-    // With no tick resource present, `set_store_tick` panics.
     let _ = world.run_system_once(set_store_tick::<Tick>);
 }

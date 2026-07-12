@@ -101,11 +101,8 @@ fn first_tick() {
     assert_eq!(RepliconTick::new(10), history.first_tick());
 }
 
-/// Build `(tick, input)` entries as one concrete iterator type. Every
-/// `replace_section` call below goes through this same type so a single
-/// monomorphization accumulates full branch coverage (llvm-cov summarizes a
-/// generic function by its best-covered instantiation, and each closure-based
-/// iterator would otherwise be its own partially-covered instantiation).
+// One concrete iterator type so llvm-cov accumulates branch coverage in a single
+// monomorphization rather than many partially-covered per-closure instantiations.
 #[cfg(feature = "client")]
 fn entries(list: impl IntoIterator<Item = (u32, A)>) -> std::vec::IntoIter<(RepliconTick, A)> {
     list.into_iter()
@@ -119,7 +116,6 @@ fn entries(list: impl IntoIterator<Item = (u32, A)>) -> std::vec::IntoIter<(Repl
 fn replace_section() {
     let original = hist(10, [A(1), A(2), A(3), A(4)]);
 
-    // We replace a section at the end
     let mut history = original.clone();
     history.list.reserve_exact(6);
     history.replace_section(entries([(13, A(10)), (14, A(11))]));
@@ -127,7 +123,6 @@ fn replace_section() {
     let expected = hist(10, [A(1), A(2), A(3), A(10), A(11)]);
     assert_eq!(expected, history);
 
-    // We replace a section at the start
     let mut history = original.clone();
     history.list.reserve_exact(6);
     history.replace_section(entries([(8, A(10)), (9, A(11)), (10, A(12))]));
@@ -135,7 +130,6 @@ fn replace_section() {
     let expected = hist(8, [A(10), A(11), A(12), A(2), A(3), A(4)]);
     assert_eq!(expected, history);
 
-    // We replace a section in the middle
     let mut history = original.clone();
     history.list.reserve_exact(6);
     history.replace_section(entries([(11, A(10)), (12, A(11))]));
@@ -143,7 +137,6 @@ fn replace_section() {
     let expected = hist(10, [A(1), A(10), A(11), A(4)]);
     assert_eq!(expected, history);
 
-    // We replace the history with section much later
     let mut history = original.clone();
     history.list.reserve_exact(6);
     history.replace_section(entries([(50, A(10)), (51, A(11))]));
@@ -152,8 +145,6 @@ fn replace_section() {
     assert_eq!(expected, history);
 }
 
-/// `map_entities` remaps every entity carried inside the stored inputs when
-/// the history crosses the network boundary.
 #[test]
 fn map_entities_remaps_stored_inputs() {
     let mut world = World::new();
@@ -166,8 +157,6 @@ fn map_entities_remaps_stored_inputs() {
     assert_eq!(hist(3, [E(to), E(to)]), history);
 }
 
-/// An entry far behind the existing window (more than the front-fill budget)
-/// is stale redundancy and must be dropped rather than front-filled.
 #[cfg(feature = "client")]
 #[test]
 fn replace_section_skips_entries_far_in_the_past() {
@@ -179,8 +168,6 @@ fn replace_section_skips_entries_far_in_the_past() {
     assert_eq!(original, history, "an ancient entry must be dropped");
 }
 
-/// A degenerate empty history whose `updated_at` equals the incoming tick
-/// (`first_tick()` collapses to `updated_at`) is seeded rather than indexed.
 #[cfg(feature = "client")]
 #[test]
 fn replace_section_seeds_empty_history_in_range() {

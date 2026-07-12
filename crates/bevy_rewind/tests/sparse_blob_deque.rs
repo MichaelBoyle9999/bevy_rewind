@@ -1,5 +1,3 @@
-//! Tests for the sparse blobby ring buffer (`src/history/sparse_blob_deque.rs`).
-
 #[path = "support/comp_a.rs"]
 mod comp_a;
 #[path = "support/comp_b.rs"]
@@ -23,18 +21,10 @@ use core::num::NonZero;
 use bevy::ptr::PtrMut;
 use bevy_rewind::history::sparse_blob_deque::SparseBlobDeque;
 
-// Closures are funnelled through these monomorphic helpers so the generic
-// `append`/`replace` methods are instantiated once per helper (not once per
-// call-site), letting a single instantiation exercise every branch. The value is
-// passed as an `Option` and mapped into the closure, so the `Some` (store) and
-// `None` (empty slot) paths share one instantiation.
-
-/// Append an `A(v)` value, or an empty (sparse) slot when `v` is `None`.
 fn ap(h: &mut SparseBlobDeque, v: Option<u16>) {
     unsafe { h.append(v.map(|v| move |ptr: PtrMut| *ptr.deref_mut::<A>() = A(v))) };
 }
 
-/// Append a drop-tracked `D(v)` value, or an empty slot when `v` is `None`.
 fn ad(h: &mut SparseBlobDeque, v: Option<u16>, drops: &DropList) {
     unsafe {
         h.append(v.map(|v| {
@@ -45,9 +35,6 @@ fn ad(h: &mut SparseBlobDeque, v: Option<u16>, drops: &DropList) {
     }
 }
 
-/// Replace the slot at `i` with `A(v)`. Zero-sized replaces reuse this helper:
-/// the closure is never invoked for a zero-sized deque (`items.get_mut` yields
-/// `None`), so a single instantiation covers both paths.
 fn rep(h: &mut SparseBlobDeque, i: usize, v: u16) {
     unsafe { h.replace(i, |ptr| *ptr.deref_mut::<A>() = A(v)) };
 }
@@ -103,17 +90,14 @@ fn dense_storage() {
         ap(&mut history, None);
     }
 
-    // None items shouldn't add capacity
     assert_eq!(5, history.len());
     assert_eq!(1, history.items.capacity());
 
     ap(&mut history, Some(1));
-    // We shouldn't need to expand yet
     assert_eq!(1, history.items.len());
     assert_eq!(1, history.items.capacity());
 
     ap(&mut history, Some(2));
-    // Expand to fit just the new item
     assert_eq!(2, history.items.len());
     assert_eq!(2, history.items.capacity());
 
@@ -121,7 +105,6 @@ fn dense_storage() {
         ap(&mut history, None);
     }
 
-    // We don't release memory if the items are wrapped out of history
     assert_eq!(0, history.items.len());
     assert_eq!(2, history.items.capacity());
 
@@ -129,7 +112,6 @@ fn dense_storage() {
         ap(&mut history, Some(i));
     }
 
-    // We should never make it exceed our own capacity
     assert_eq!(10, history.items.len());
     assert_eq!(10, history.items.capacity());
 }
@@ -168,8 +150,6 @@ fn append_sparse_wrap_drops_items() {
         if i % 2 == 0 {
             ad(&mut history, Some(i), &drops);
         } else {
-            // Empty slots go through the D helper too, so the `None` path shares
-            // the drop-tracked closure's instantiation.
             ad(&mut history, None, &drops);
         }
     }
@@ -242,7 +222,6 @@ fn extend_back() {
     ap(&mut history, Some(1));
     assert_eq!(1, history.len());
 
-    // Extend the back without needing to remove anything
     history.extend_back(2);
     assert_eq!(3, history.len());
     assert_eq!(Some(&A(1)), history.get(0).deref());
@@ -255,7 +234,6 @@ fn extend_back() {
     assert_eq!(5, history.len());
     assert_eq!(3, history.stored_items());
 
-    // Wrap items out of history with empty items
     history.extend_back(4);
     eprintln!("{:?}", history);
     assert_eq!(5, history.len());
@@ -265,7 +243,6 @@ fn extend_back() {
         assert_eq!(None, history.get(i).deref::<A>());
     }
 
-    // Wrap more than full capacity
     history.extend_back(7);
     assert_eq!(5, history.len());
     assert_eq!(0, history.stored_items());
@@ -384,7 +361,6 @@ fn replace_out_of_bounds_is_noop() {
     let mut history = SparseBlobDeque::from_type::<A>(NonZero::new(5).unwrap());
     ap(&mut history, Some(1));
 
-    // Replacing beyond the length does nothing.
     rep(&mut history, 5, 9);
 
     assert_eq!(1, history.len());
@@ -393,8 +369,6 @@ fn replace_out_of_bounds_is_noop() {
 
 #[test]
 fn replace_zero_sized_existing_slot() {
-    // A zero-sized type stores no bytes, so `items.get_mut` on an existing
-    // (bit-set) slot yields `None`, taking the no-op replace path.
     let mut history = SparseBlobDeque::from_type::<B>(NonZero::new(5).unwrap());
     ap(&mut history, Some(0));
     assert_eq!(1, history.stored_items());

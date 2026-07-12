@@ -50,10 +50,8 @@ pub fn load_and_clear_prediction(
     let mut inserts = InsertBatch::new();
     let mut removes = RemoveBatch::new();
 
-    // TODO: Can we par_iter this?
     for (entity, mut predicted, maybe_authoritative, horizon, is_disabled) in q.iter_mut() {
-        // Past the body's received-input horizon the authority is a guess; keep the
-        // prediction (treat auth as Missing) rather than reconcile to it.
+        // Past the input horizon the authority is a guess; keep the prediction.
         let beyond_horizon = horizon.is_some_and(|h| previous_tick.get() > h.0);
         for (&comp_id, pred_hist) in predicted.iter_mut() {
             let &reg_idx = registry.ids.get(&comp_id).unwrap();
@@ -84,8 +82,6 @@ pub fn load_and_clear_prediction(
                 }
                 (TickData::Missing, TickData::Missing) => {
                     if !is_disabled {
-                        // We are loading a value from before the history
-                        // remove the component until the history starts
                         removes.push(comp_id);
                         pred_hist.keep_first_item();
                         continue;
@@ -131,10 +127,8 @@ pub fn load_confirmed_authoritative(
     let mut inserts = InsertBatch::new();
     let mut removes = RemoveBatch::new();
 
-    // TODO: Can we par_iter this?
     for (entity, authoritative, confirmed, horizon) in q.iter_mut() {
-        // Past the body's received-input horizon the authority is a guess; keep the
-        // resim's own prediction for this body rather than reconciling to it.
+        // Past the input horizon the authority is a guess; keep the prediction.
         if horizon.is_some_and(|h| previous_tick.get() > h.0) {
             continue;
         }
@@ -177,9 +171,6 @@ pub fn load_confirmed_authoritative(
     }
 }
 
-/// Query of the histories needed to decide whether a self-predicted entity
-/// mispredicted. Every [`Predicted`] body — whether driven by local input or by a
-/// remote peer's replayed input — flows through this one rollback path.
 pub type DivergenceQuery<'w, 's> = Query<
     'w,
     's,
@@ -192,26 +183,8 @@ pub type DivergenceQuery<'w, 's> = Query<
     With<Predicted>,
 >;
 
-/// Returns `true` if replaying the resim window `[start, real_tick]` would
-/// actually change the present state of any self-predicted entity — i.e. some
-/// confirmed authoritative value at a resim load point differs from what that
-/// entity predicted there. The resim of tick `t` loads at `t - 1`, so the load
-/// points span the closed range `[start - 1, real_tick - 1]`.
-///
-/// This is the divergence gate for `calculate_rollback_target`: a confirm that
-/// merely *arrives* does not warrant a rollback unless the prediction was
-/// actually wrong. Without it, the loopback exchange (server ticks first, so
-/// the global confirm channel lands one tick behind every tick) fires a depth-1
-/// rollback every tick even when the prediction is perfect.
-///
-/// The confirm gating and `get_latest` load-point lookups mirror
-/// [`load_confirmed_authoritative`] exactly, so "would change state" is
-/// precisely "the rollback's authoritative load would overwrite a predicted
-/// value with a different one".
-///
-/// NOTE: equality is `RollbackRegistry`'s `equal` (`PartialEq`), which is
-/// bit-exact for floating-point components. This is a deliberately weak
-/// placeholder — see `calculate_rollback_target` for the full caveat.
+/// Resim of tick `t` loads at `t - 1`, so the load points span the closed range
+/// `[start - 1, real_tick - 1]`.
 pub fn rollback_would_change_state(
     q: &DivergenceQuery,
     registry: &RollbackRegistry,
@@ -229,24 +202,14 @@ pub fn rollback_would_change_state(
         .any(|(pred, auth, confirm, horizon)| scan.entity_diverged(pred, auth, confirm, horizon))
 }
 
-/// The shared context of a divergence scan: the component registry, the global
-/// confirm channel, and the load-point range `[lo, hi]` under evaluation.
 pub struct DivergenceScan<'a> {
-    /// The rollback component registry
     pub registry: &'a RollbackRegistry,
-    /// The global confirm channel
     pub global_confirm: &'a ServerMutateTicks,
-    /// The low end of the load-point range under evaluation
     pub lo: u32,
-    /// The high end of the load-point range under evaluation
     pub hi: u32,
 }
 
 impl DivergenceScan<'_> {
-    /// Per-entity half of [`rollback_would_change_state`]: scans the load-point
-    /// range `[lo, hi]` for a confirmed authoritative value that differs from the
-    /// predicted value, mirroring [`load_confirmed_authoritative`]'s confirm gate
-    /// and `get_latest` lookups.
     pub fn entity_diverged(
         &self,
         pred: &PredictedHistory,
@@ -260,8 +223,7 @@ impl DivergenceScan<'_> {
             let pred_hist = pred.get(&comp_id);
 
             for p in self.lo..=self.hi {
-                // Past the body's received-input horizon the authority is a guess, not
-                // a misprediction to correct — skip it so it never triggers a rollback.
+                // Past the input horizon the authority is a guess, not a misprediction.
                 if horizon.is_some_and(|h| p > h.0) {
                     continue;
                 }
@@ -280,25 +242,16 @@ impl DivergenceScan<'_> {
                     .unwrap_or(TickData::Missing);
 
                 match auth_data {
-                    // No authoritative value at this load point: the rollback would
-                    // not load anything here, so it cannot change state.
                     TickData::Missing => continue,
-                    // The component would be removed; that changes state only if it
-                    // is currently present in the prediction.
                     TickData::Removed => {
                         if matches!(pred_data, TickData::Value(_)) {
                             return true;
                         }
                     }
-                    // A value would be loaded; that changes state unless the
-                    // prediction already holds an equal value at this load point.
                     TickData::Value(auth_value) => match pred_data {
                         TickData::Value(pred_value) => {
                             // SAFETY: both pointers come from histories registered
                             // under `comp_id`, which is what `component` describes.
-                            // Tolerance-aware: a difference within the component's
-                            // registered tolerance is not a divergence, so float noise
-                            // below the sim's non-determinism floor never rolls back.
                             if !unsafe { component.within_tolerance(auth_value, pred_value) } {
                                 return true;
                             }
@@ -324,7 +277,6 @@ pub fn reinsert_predicted(
 ) {
     let mut inserts = InsertBatch::new();
 
-    // TODO: Can we par_iter this?
     for (entity, archetype, predicted, authoritative) in q.iter_mut() {
         for (&comp_id, pred_hist) in predicted.iter() {
             if archetype.contains(comp_id) {
@@ -335,7 +287,6 @@ pub fn reinsert_predicted(
                 continue;
             };
 
-            // TODO: only insert if authoritative is not known yet
             _ = authoritative;
 
             let &reg_idx = registry.ids.get(&comp_id).unwrap();

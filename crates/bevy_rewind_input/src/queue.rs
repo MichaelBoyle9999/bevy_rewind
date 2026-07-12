@@ -90,7 +90,6 @@ impl<T: InputTrait> InputQueue<T> {
         let existing: Vec<(RepliconTick, T)> = self
             .queue
             .drain(..)
-            // Drop existing slots overlapping the history's range — history wins on conflict.
             .filter(|(t, _)| *t < history_first || *t > history_last)
             .collect();
 
@@ -114,19 +113,12 @@ impl<T: InputTrait> InputQueue<T> {
         earliest_novel
     }
 
-    /// Consume the input for `tick`: the exact queued input when present,
-    /// otherwise the newest late (or last consumed) input repeated forward.
     pub fn next(&mut self, tick: impl Into<RepliconTick>) -> Option<T> {
         let tick = tick.into();
-        // Pop every entry at or below `tick`; the queue is tick-sorted, so the
-        // last popped entry is either the exact input for `tick` or the newest
-        // late input the simulator has now moved past.
         let mut newest = None;
         while self.queue.front().is_some_and(|(t, _)| *t <= tick) {
             newest = self.queue.pop_front();
         }
-        // An exact hit is consumed as-is; a late input stands in by repeating
-        // forward to `tick`.
         let hit = newest.and_then(|(from_tick, t)| {
             if from_tick == tick {
                 Some(t)

@@ -1,9 +1,3 @@
-//! Coverage for the authoritative marker callbacks (`write_authoritative_history`
-//! and `remove_authoritative_history`), driven end-to-end through replicon's
-//! in-memory test backend. These callbacks are only reachable via replication:
-//! replicon invokes them for a rollback-tracked component on an entity carrying
-//! the `Predicted` marker.
-
 #[path = "support/sim_tick.rs"]
 mod sim_tick;
 
@@ -19,16 +13,9 @@ use bevy_rewind::history::AuthoritativeHistory;
 use bevy_rewind::{Predicted, RollbackApp, RollbackPlugin};
 use serde::{Deserialize, Serialize};
 
-/// A replicated, rollback-tracked payload component whose `Deserialize`
-/// deliberately fails on the sentinel value `0xFFFF`. Keeping the success and
-/// error paths on a *single* replicated type means there is one
-/// `write_authoritative_history::<Payload>` instantiation that covers both sides
-/// of the `deserialize(...)?` — the per-monomorphisation coverage gate credits
-/// the `?` error branch only within an instantiation that actually errors.
 #[derive(Component, Clone, Copy, PartialEq, Eq, Debug, Deref, DerefMut)]
 struct Payload(u16);
 
-/// The value whose deserialization fails.
 const BAD_PAYLOAD: u16 = 0xFFFF;
 
 impl Serialize for Payload {
@@ -47,13 +34,12 @@ impl<'de> Deserialize<'de> for Payload {
     }
 }
 
-/// The store schedule label; never run automatically in these tests.
 #[derive(ScheduleLabel, Clone, PartialEq, Eq, Debug, Hash)]
 struct StoreSched;
 
-/// Build one side of the pair. The plugin stack must be identical on both sides:
-/// `RollbackPlugin` calls replicon's `track_mutate_messages`, which changes the
-/// wire format, so an asymmetric install would silently drop all replication.
+// The plugin stack must be identical on both sides: RollbackPlugin's
+// track_mutate_messages changes the wire format, so an asymmetric install
+// silently drops all replication.
 fn build_app() -> App {
     let mut app = App::new();
     app.add_plugins((
@@ -77,8 +63,6 @@ fn build_app() -> App {
     app
 }
 
-/// Connect a server/client pair with one replicated `Payload` entity, returning
-/// `(server, client, server_entity, client_entity)`.
 fn replicated_pair() -> (App, App, Entity, Entity) {
     let mut server = build_app();
     let mut client = build_app();
@@ -103,12 +87,9 @@ fn replicated_pair() -> (App, App, Entity, Entity) {
 fn authoritative_write_records_history() {
     let (mut server, mut client, s_e, c_e) = replicated_pair();
 
-    // Mark the client entity predicted so replicon routes Payload through the
-    // marker write callback.
     client.world_mut().entity_mut(c_e).insert(Predicted);
     client.world_mut().flush();
 
-    // Mutate on the server and deliver.
     **server
         .world_mut()
         .entity_mut(s_e)
@@ -118,7 +99,6 @@ fn authoritative_write_records_history() {
     server.exchange_with_client(&mut client);
     client.update();
 
-    // The authoritative value landed in AuthoritativeHistory, not the live component.
     let comp = client.world_mut().register_component::<Payload>();
     let hist = client
         .world()
@@ -135,7 +115,6 @@ fn authoritative_remove_runs_marker_callback() {
     client.world_mut().entity_mut(c_e).insert(Predicted);
     client.world_mut().flush();
 
-    // First a mutation to populate the history via the write callback...
     **server
         .world_mut()
         .entity_mut(s_e)
@@ -145,14 +124,11 @@ fn authoritative_remove_runs_marker_callback() {
     server.exchange_with_client(&mut client);
     client.update();
 
-    // ...then a removal, which replicon routes through the remove callback.
     server.world_mut().entity_mut(s_e).remove::<Payload>();
     server.update();
     server.exchange_with_client(&mut client);
     client.update();
 
-    // The entity survives (the marker remove callback records the removal in
-    // history rather than deleting the entity).
     assert!(client.world().entities().contains(c_e));
 }
 
@@ -163,8 +139,6 @@ fn authoritative_write_propagates_deserialize_error() {
     client.world_mut().entity_mut(c_e).insert(Predicted);
     client.world_mut().flush();
 
-    // Mutate to the sentinel value: the client's marker write callback then fails
-    // to deserialize it, exercising the `deserialize(...)?` error path.
     **server
         .world_mut()
         .entity_mut(s_e)
@@ -174,6 +148,5 @@ fn authoritative_write_propagates_deserialize_error() {
     server.exchange_with_client(&mut client);
     client.update();
 
-    // The client survives the deserialize error.
     assert!(client.world().entities().contains(c_e));
 }

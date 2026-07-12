@@ -1,9 +1,6 @@
-//! A simple simulation-tick resource satisfying `bevy_rewind::TickSource`.
-
 use bevy::prelude::*;
 use bevy_replicon::shared::replicon_tick::RepliconTick;
 
-/// A simulation tick counter usable as a `TickSource`
 #[derive(Resource, Clone, Copy, Deref, DerefMut, PartialEq, Eq, Debug, Default)]
 pub struct Tick(pub u32);
 

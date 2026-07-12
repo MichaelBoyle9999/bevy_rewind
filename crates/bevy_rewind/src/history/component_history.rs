@@ -34,14 +34,10 @@ impl core::fmt::Debug for ComponentHistory {
     }
 }
 
-/// Data for a single tick
 #[derive(Debug)]
 pub enum TickData<T> {
-    /// A value
     Value(T),
-    /// The value was removed this tick
     Removed,
-    /// There is no data for this tick
     Missing,
 }
 
@@ -66,7 +62,6 @@ impl<T: PartialEq> PartialEq for TickData<T> {
 impl<T: Eq> Eq for TickData<T> {}
 
 impl<T> TickData<T> {
-    // Get the value, if any
     pub fn value(self) -> Option<T> {
         match self {
             TickData::Value(t) => Some(t),
@@ -162,7 +157,6 @@ impl ComponentHistory {
         let item_ago = (self.list.mask() & search_mask).trailing_zeros();
         let len = self.list.len() as u32;
         if removed_ago > len && item_ago > len {
-            // No removed or items found
             return TickData::Missing;
         }
         if removed_ago <= item_ago {
@@ -171,15 +165,11 @@ impl ComponentHistory {
 
         let index = self.len() - 1 - item_ago as usize;
 
-        // SAFETY: reaching here means `item_ago <= len` (otherwise the
-        // `removed_ago > len && item_ago > len` guard above returned `Missing`,
-        // and `removed_ago <= item_ago` returned `Removed`), so `item_ago` is the
-        // `trailing_zeros` of a genuinely set bit in `self.list.mask()`. Slot
-        // `index` is therefore occupied and `get` cannot return `None`.
+        // SAFETY: reaching here means `item_ago` indexes a set bit in
+        // `self.list.mask()`, so slot `index` is occupied and `get` is `Some`.
         TickData::Value(unsafe { self.list.get(index).unwrap_unchecked() })
     }
 
-    // Get the number of empty items after the specified tick
     pub fn empty_after(&self, tick: u32) -> u32 {
         if self.list.is_empty() {
             return 0;
@@ -188,8 +178,6 @@ impl ComponentHistory {
             return 64;
         }
 
-        // The history's capacity is at most 64 (see `SparseBlobDeque::new`), so
-        // `ago` — clamped to `len - 1` — is always at most 63.
         let ago = ((self.last_tick - tick) as usize).min(self.len().saturating_sub(1));
         let search_mask = (1 << (ago as u64)) - 1;
 
@@ -197,25 +185,16 @@ impl ComponentHistory {
         empty.leading_zeros() - (64u32.saturating_sub(ago as u32))
     }
 
-    /// Write a value for `tick`, filling any gap since the last written tick
-    ///
     /// # Safety
     /// - The value written in `write_fn` MUST match the type this history was made for
     /// - `write_fn` MUST write to the [`PtrMut`], or the value will be uninitialized
     pub unsafe fn write(&mut self, tick: u32, write_fn: impl FnOnce(PtrMut)) {
-        // Delegate immediately to the non-generic `write_dyn` so all the branch
-        // logic lives in a single instantiation (this generic wrapper is
-        // branch-free).
         let mut write_fn = Some(write_fn);
-        // SAFETY: `write_dyn` invokes the closure at most once (it calls exactly
-        // one of `replace`/`append`, each of which runs the closure at most once),
-        // so `take()` always yields `Some` here — no second call can observe `None`.
+        // SAFETY: `write_dyn` invokes the closure at most once, so `take()` always
+        // yields `Some` here.
         unsafe { self.write_dyn(tick, &mut |ptr| (write_fn.take().unwrap_unchecked())(ptr)) }
     }
 
-    /// The branch-bearing body of [`write`](Self::write), kept non-generic so its
-    /// branches are counted once rather than once per `write_fn` type.
-    ///
     /// # Safety
     /// Same contract as [`write`](Self::write): `write_fn` must write a value of
     /// this history's type to the [`PtrMut`].
@@ -257,7 +236,6 @@ impl ComponentHistory {
 
             self.removed_mask |= 1 << ago;
 
-            // TODO: Remove item if there was one
             return;
         }
 
@@ -280,17 +258,13 @@ impl ComponentHistory {
         let gap = tick - 1 - self.last_tick;
 
         if gap as usize >= self.list.capacity() {
-            // Nothing of the current history fits in the new history
-
             if self.list.stored_items() == 0 && self.removed_mask == 0 {
-                // If there are no items we just need to set the size
                 self.list
                     .extend_back((gap as usize).min(self.list.capacity()));
                 self.last_tick += gap;
                 return;
             }
 
-            // If the last item isn't at the back, move it to the back, then clear the rest
             let newest_item = self.list.mask().trailing_zeros();
             let newest_remove = self.removed_mask.trailing_zeros();
             let newest_bit = newest_item.min(newest_remove);
@@ -354,10 +328,8 @@ impl ComponentHistory {
             let retained = self.list.len() - 1;
             let bits_to_swap = 0b11 << (retained - 1);
             if self.list.mask() & (search_mask << 1) != 0 {
-                // Swapping item
                 *self.list.mask_mut() ^= bits_to_swap;
             } else if self.removed_mask & (search_mask << 1) != 0 {
-                // Swapping removed
                 self.removed_mask ^= bits_to_swap;
             }
         }

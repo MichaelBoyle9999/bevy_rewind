@@ -1,12 +1,9 @@
-// Data types
 pub mod blob_deque;
 pub mod sparse_blob_deque;
 
-// Shared history types
 pub mod component;
 pub mod component_history;
 
-// Specific history types
 pub mod authoritative;
 pub use authoritative::AuthoritativeHistory;
 pub mod predicted;
@@ -20,8 +17,6 @@ pub(crate) use load::{DivergenceQuery, rollback_would_change_state};
 
 use bevy::{ecs::component::ComponentId, platform::collections::HashMap, prelude::*};
 use component::HistoryComponent;
-
-// TODO: Add some extra safeguards to check types and reduce places to duplicate them
 
 pub struct HistoryPlugin;
 
@@ -50,9 +45,6 @@ impl RollbackRegistry {
         self.components.push(HistoryComponent::new::<T>());
     }
 
-    /// Register a component whose divergence gate uses `tolerance` instead of
-    /// exact equality: a confirmed-vs-predicted difference within tolerance does
-    /// not warrant a rollback. History de-duplication still uses exact `PartialEq`.
     pub fn register_with_tolerance<T: Component + Clone + PartialEq>(
         &mut self,
         world: &mut World,

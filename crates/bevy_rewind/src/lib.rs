@@ -106,15 +106,12 @@ impl<Tick: TickSource> Plugin for RollbackPlugin<Tick> {
     }
 }
 
-/// The tick to load data from
 #[derive(Resource, Deref)]
 pub struct LoadFrom(pub RepliconTick);
 
-/// The tick state is currently being stored for
 #[derive(Resource, Clone, Copy, Deref)]
 pub struct StoreFor(pub RepliconTick);
 
-/// Derive [`StoreFor`] from the tick source resource
 pub fn set_store_tick<Tick: TickSource>(mut commands: Commands, tick: Option<Res<Tick>>) {
     let Some(tick) = tick else {
         panic!(
@@ -125,13 +122,9 @@ pub fn set_store_tick<Tick: TickSource>(mut commands: Commands, tick: Option<Res
     commands.insert_resource(StoreFor((*tick).into()));
 }
 
-/// The requested number of rollback frames
 #[derive(Resource, Default, Deref, DerefMut)]
 pub struct RequestedRollback(i16);
 
-/// The read-only inputs of the state-divergence gate in
-/// [`calculate_rollback_target`]: the per-entity histories to compare, the
-/// component registry, and the global confirm channel.
 #[derive(SystemParam)]
 struct DivergenceGate<'w, 's> {
     diverged: history::DivergenceQuery<'w, 's>,
@@ -150,19 +143,9 @@ fn calculate_rollback_target<Tick: TickSource>(
 ) {
     let tick = (*tick).into();
 
-    // Whether an eager path (input-divergence detection in `receive_inputs`) already
-    // requested a rollback this tick, captured before the confirm-message
-    // composition below overwrites it. An eager target is a *proven* misprediction —
-    // the just-arrived input differs from what was predicted (repeated) for that
-    // tick — so it must NOT be vetoed by the state-divergence gate further down,
-    // whose confirmed-state comparison lags the input by the state-replication
-    // delay. Without this, a client that has the remote peer's new input in hand
-    // still coasts on the stale prediction until the *state* confirm catches up,
-    // overshooting a remote body's direction change; with it, the client reconciles
-    // on input arrival, as promptly as the server's own (ungated) eager path does.
-    // No-op on the server: its gate is already inert (`gate.diverged.is_empty()`, no
-    // inbound `AuthoritativeHistory` for bodies it owns), so the added term changes
-    // nothing there — only the client, whose gate is live, is freed.
+    // An eager target (input-divergence in `receive_inputs`) is a proven
+    // misprediction and must bypass the state-divergence gate below, whose
+    // confirmed-state comparison lags the input by the replication delay.
     let eager_in = **rollback_target;
 
     for message_tick in individual_confirms
@@ -185,43 +168,13 @@ fn calculate_rollback_target<Tick: TickSource>(
     let target = RepliconTick::new(rollback_target.unwrap_or(tick).get().max(min));
 
     **requested_info = (tick.get() as i64 - target.get() as i64) as i16;
-    // Same-tick targets are dropped — we're already at this tick, nothing to replay.
     if target == tick {
         return;
     }
 
-    // Divergence gate (past targets only). A confirm landing at a past tick only
-    // warrants a rollback if replaying from it would actually change the present
-    // state — i.e. some self-predicted entity's confirmed authoritative value at a
-    // resim load point differs from what it predicted there. At zero latency the
-    // global confirm channel lands one tick behind every tick (the server ticks
-    // first in the loopback exchange), which previously fired a depth-1 rollback
-    // every tick even though the prediction was perfect. Gating on real divergence
-    // makes that chronic rollback disappear, while still firing exactly one
-    // corrective rollback when the prediction is genuinely wrong — e.g. the
-    // spawn-collapse position handoff onto a client's own body. Every `Predicted`
-    // body (local-input or remote-replayed) is delivered by this one rollback path.
-    // See `game/tests/client_movement_visibility.rs`.
-    //
-    // Future targets (target > tick) are NOT gated: they fast-forward in
-    // `trigger_rollback` to load just-arrived authoritative state stamped ahead of
-    // the local tick, which has no predicted counterpart to compare against.
-    //
-    // NOTE: divergence is decided by `RollbackRegistry`'s `equal`, which is
-    // `PartialEq` — bit-exact for floating-point components. This is a deliberately
-    // weak placeholder: it is correct only while the client's prediction is
-    // bit-identical to the server's authoritative simulation (true for the
-    // same-binary deterministic tests; NOT guaranteed across machines, where
-    // floating-point drift would resurrect chronic rollback). Replace with a
-    // per-component tolerance (epsilon for continuous physics state, exact for
-    // discrete state) before relying on this under real cross-machine play.
-    //
-    // The gate only suppresses when there are self-predicted entities to
-    // evaluate. With none present (e.g. machinery tests that inject a target
-    // directly to exercise the rollback runtime), we cannot conclude the
-    // rollback is a no-op, so we fall through and fire as before. The game
-    // always has at least the local player's body, so the gate is always live
-    // there.
+    // Only past targets are gated: a future target has no predicted counterpart to
+    // compare, and gating past targets on real divergence avoids a chronic depth-1
+    // rollback every tick at zero latency (the global confirm lands one tick late).
     if target.get() < tick.get()
         && eager_in.is_none()
         && !gate.diverged.is_empty()
@@ -244,38 +197,25 @@ fn calculate_rollback_target<Tick: TickSource>(
 #[derive(Resource, Deref)]
 struct SimulationScheduleLabel(Interned<dyn ScheduleLabel>);
 
-/// A resource only present if data was already loaded for a given resimulation
 #[derive(Resource)]
 pub struct AlreadyLoaded;
 
-/// Present only while [`trigger_rollback`] is replaying past ticks (i.e. while
-/// the user's simulation schedule is running as a *resim*, not a forward step).
-/// Systems that distinguish "load historical input" (resim) from "use live
-/// input" (forward) can gate on `Option<Res<Resimulating>>`. Inserted just
-/// before each resim tick's `PreResimulation`/schedule/`PostResimulation`
-/// triple and removed immediately after, so neither the initial `Rollback`
-/// state-load nor `BackToPresent` is included.
 #[derive(Resource)]
 pub struct Resimulating;
 
 fn trigger_rollback<Tick: TickSource>(world: &mut World) {
     let schedule = **world.resource::<SimulationScheduleLabel>();
 
-    // Swap to Time<Fixed>
     *world.resource_mut::<Time>() = world.resource::<Time<Fixed>>().as_generic();
 
     let real_tick: RepliconTick = (*world.resource::<Tick>()).into();
-    // Read but do not yet clear the target so `PreRollback` systems can inspect it
-    // — e.g. `bevy_rewind_entity_management::disable_unspawned_during_rollback`
-    // needs the rollback target to mark `Predicted` entities spawned after that
-    // tick as `Unspawned` before `Rollback`'s `load_and_clear_prediction` runs.
-    // `rollback_requested` is the gate; this resolves to `Some` by construction.
+    // PreRollback must read the target before it is cleared: entity_management's
+    // disable_unspawned_during_rollback marks entities spawned after the target.
     let start = (**world.resource::<RollbackTarget>())
         .expect("rollback_requested gates trigger_rollback; target must be Some");
 
     world.run_schedule(RollbackSchedule::PreRollback);
 
-    // Clear the request now that PreRollback has had its chance to read it.
     **world.resource_mut::<RollbackTarget>() = None;
 
     world.insert_resource(LoadFrom(RepliconTick::new(start.get().saturating_sub(1))));
@@ -283,40 +223,23 @@ fn trigger_rollback<Tick: TickSource>(world: &mut World) {
     world.run_schedule(RollbackSchedule::Rollback);
     world.run_schedule(RollbackSchedule::PostRollback);
 
-    // A future target (start > real_tick) loads just-arrived authoritative state
-    // and runs no resim ticks (the loop below is empty). It must NOT touch
-    // `Time<Fixed>`: the tick source is re-derived from the confirmed-tick
-    // estimate every `FixedPreUpdate`, so the present is owned by that clock, and
-    // discarding fixed-time overstep here (as this branch once did) permanently
-    // stole wall time from the simulation. On a client running behind the host —
-    // every real connection, via the stale connect seed — fresh confirms land
-    // ahead of the present every frame, so the discard fired repeatedly, starving
-    // fixed steps and compounding into runaway clock drift (input lateness,
-    // rendered delay, and overshoot of remote bodies). See
-    // `game/tests/clock_drift.rs`.
-
-    // The first resimulated frame should be marked as already loaded
+    // A future target runs no resim ticks and must NOT touch Time<Fixed>:
+    // discarding fixed-time overstep here steals wall time and compounds into
+    // runaway clock drift. See game/tests/clock_drift.rs.
     world.insert_resource(AlreadyLoaded);
 
     for tick in start.get()..=real_tick.get() {
-        // Set the correct ticks
         let tick = RepliconTick::new(tick);
         world.insert_resource(LoadFrom(RepliconTick::new(tick.get().saturating_sub(1))));
         world.insert_resource(Tick::from(tick));
 
-        // Mark resim active so input/state systems can distinguish "replay from
-        // history" from "drive from live input". Scoped to the
-        // PreResim → schedule → PostResim triple per tick.
         world.insert_resource(Resimulating);
 
-        // Run PreResimulation
         world.run_schedule(RollbackSchedule::PreResimulation);
         world.remove_resource::<AlreadyLoaded>();
 
-        // Run the simulation schedule defined by the user
         world.run_schedule(schedule);
 
-        // Run PostResimulation
         world.run_schedule(RollbackSchedule::PostResimulation);
 
         world.remove_resource::<Resimulating>();
@@ -324,42 +247,29 @@ fn trigger_rollback<Tick: TickSource>(world: &mut World) {
 
     world.run_schedule(RollbackSchedule::BackToPresent);
 
-    // Swap back to Time<Virtual>
     *world.resource_mut::<Time>() = world.resource::<Time<Virtual>>().as_generic();
 }
 
-/// The schedule label for the schedule in which data is stored
 #[derive(Resource, Deref)]
 pub struct StoreScheduleLabel(Interned<dyn ScheduleLabel>);
 
-/// An extension trait for [`App`] adding functions to register rollback components
 pub trait RollbackApp {
-    /// Register a predicted-only component
     fn register_predicted_component<
         T: Component<Mutability = Mutable> + Clone + Debug + PartialEq,
     >(
         &mut self,
     ) -> &mut Self;
-    /// Register an authoritative component
     fn register_authoritative_component<
         T: Component<Mutability = Mutable> + Clone + Debug + PartialEq,
     >(
         &mut self,
     ) -> &mut Self;
-    /// Register an authoritative component whose divergence gate uses `tolerance`
-    /// rather than exact equality: a confirmed-vs-predicted difference within
-    /// tolerance is not treated as a misprediction and does not trigger a
-    /// rollback. For a non-deterministic float simulation this is what keeps
-    /// cross-process drift below the sim's non-determinism floor from firing a
-    /// chronic, spurious rollback every tick. History de-duplication is unchanged
-    /// (still exact `PartialEq`).
     fn register_authoritative_component_with_tolerance<
         T: Component<Mutability = Mutable> + Clone + Debug + PartialEq,
     >(
         &mut self,
         tolerance: fn(&T, &T) -> bool,
     ) -> &mut Self;
-    /// Register a predicted-only resource
     fn register_predicted_resource<T: Resource + Clone + Debug>(&mut self) -> &mut Self;
 }
 
@@ -369,7 +279,6 @@ impl RollbackApp for App {
     >(
         &mut self,
     ) -> &mut Self {
-        // Register component to rollback component registry
         let mut registry = self
             .world_mut()
             .remove_resource::<RollbackRegistry>()
@@ -411,7 +320,6 @@ impl RollbackApp for App {
     fn register_predicted_resource<T: Resource + Clone + Debug>(&mut self) -> &mut Self {
         self.world_mut().init_resource::<ResourceHistory<T>>();
 
-        // Register store systems
         let store_schedule = **self.world().resource::<StoreScheduleLabel>();
         self.add_systems(
             RollbackSchedule::PreRollback,
@@ -432,7 +340,6 @@ impl RollbackApp for App {
     }
 }
 
-/// A marker component for predicted entities
 #[derive(Component, Default)]
 #[require(history::PredictedHistory, AuthoritativeHistory)]
 #[component(on_remove = remove_histories)]
@@ -445,47 +352,27 @@ fn remove_histories(mut world: DeferredWorld, ctx: HookContext) {
         .try_remove::<(history::PredictedHistory, AuthoritativeHistory)>();
 }
 
-/// Data for a tick
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum TickData<T> {
-    /// There is a value for the tick
     Value(T),
-    /// The component/resource has been removed
     Removed,
-    /// The data is missing
     Missing,
 }
 
-/// A set of schedule labels for rollbacking
 #[derive(ScheduleLabel, Clone, PartialEq, Eq, Debug, Hash)]
 pub enum RollbackSchedule {
-    /// This schedule is executed before the tick is changed and anything is rolled back
-    /// It can be used to clear state that would be hard to roll back
     PreRollback,
-    /// This schedule is for systems to load the state for the new (old) tick
     Rollback,
-    /// This schedule is ran after everything has been rolled back, this can be used to
-    /// fix up certain state, or reapply things cleared in `PreRollback`.
     PostRollback,
-    /// This schedule is called before each resimulated tick
     PreResimulation,
-    /// This schedule is called after each resimulated tick
     PostResimulation,
-    /// This schedule is executed when the world is back to the present
     BackToPresent,
 }
 
-/// Production default for [`RollbackFrames`]. Public so consumers can put a
-/// compile-time canary against it; see `game/src/networking/components.rs`.
 pub const DEFAULT_ROLLBACK_FRAMES: u8 = 15;
 
-/// In-test value for [`RollbackFrames`], smaller to keep unit-test histories tight.
-/// Tests insert `RollbackFrames::new(TEST_ROLLBACK_FRAMES)` explicitly.
 pub const TEST_ROLLBACK_FRAMES: u8 = 5;
 
-/// A resource specifying the maximum number of rollback frames that should be stored.
-/// Because the current frame is always included and we need to load data from the previous
-/// frame, the history size is always 2 higher than thus number
 #[derive(Resource, Clone, Copy)]
 pub struct RollbackFrames(u8);
 
@@ -496,7 +383,6 @@ impl Default for RollbackFrames {
 }
 
 impl RollbackFrames {
-    /// Construct a `RollbackFrames`
     pub fn new(frames: u8) -> Self {
         if frames > 60 {
             warn!("Rollback frames cannot exceed 60 frames");
@@ -504,18 +390,15 @@ impl RollbackFrames {
         Self(frames.min(60))
     }
 
-    /// The maximum number of rollback frames configured
     pub fn max_frames(&self) -> u8 {
         self.0
     }
 
-    /// The size of the history necessary for the configured number of frames
     pub fn history_size(&self) -> usize {
         self.0 as usize + 2
     }
 }
 
-/// The tick to roll back to, reset to [`None`] after a rollback is triggered
 #[derive(Resource, Deref, DerefMut, Default)]
 pub struct RollbackTarget(Option<RepliconTick>);
 

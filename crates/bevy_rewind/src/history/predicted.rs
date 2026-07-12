@@ -28,8 +28,6 @@ impl Plugin for PredictionStorePlugin {
     }
 }
 
-// TODO: Implement cleanup to remove component histories that would entirely evaluate to Missing/Removed
-
 #[derive(Component, Deref, DerefMut, Default, Debug)]
 pub struct PredictedHistory {
     #[deref]
@@ -38,8 +36,6 @@ pub struct PredictedHistory {
 }
 
 pub fn run_store(world: &mut World) {
-    // TODO: Check rollback frames, if it changed and went up, grow histories first
-
     world.resource_scope::<ArchetypeCache, _>(|world, mut cache| {
         world.resource_scope::<RollbackRegistry, _>(|world, registry| {
             update_archetype_cache(world, &mut cache, &registry);
@@ -49,8 +45,6 @@ pub fn run_store(world: &mut World) {
             });
         });
     });
-
-    // TODO: If rollback frames went down, shrink histories afterwards
 }
 
 fn save_initial(world: &mut World) {
@@ -152,15 +146,13 @@ fn store_components(
             .map(|e| e.id())
         {
             let entity_mut = world.get_entity(entity).unwrap();
-            // SAFETY: We don't do structural changes in this system. The cache
-            // only lists archetypes containing `PredictedHistory`, so every
-            // entity in them has one.
+            // SAFETY: No structural changes here; cached archetypes all contain
+            // `PredictedHistory`.
             let mut history = unsafe { entity_mut.get_mut::<PredictedHistory>() }.unwrap();
 
             if history.last_archetype.is_some() {
                 for comp_hist in history.values_mut() {
                     if comp_hist.first_tick() >= tick {
-                        // Don't write Removed histories that haven't started yet
                         continue;
                     }
                     comp_hist.mark_removed(tick);
@@ -179,18 +171,15 @@ fn store_components(
             .map(|e| e.id())
         {
             let entity = world.get_entity(entity).unwrap();
-            // SAFETY: We don't do structural changes in this system. The cache
-            // only lists archetypes containing `PredictedHistory`, so every
-            // entity in them has one.
+            // SAFETY: No structural changes here; cached archetypes all contain
+            // `PredictedHistory`.
             let mut history = unsafe { entity.get_mut::<PredictedHistory>() }.unwrap();
 
             if let Some(last_archetype) = history.last_archetype
                 && last_archetype != entry.id
             {
-                // Archetype changed, check for components that should be marked removed
                 for (component_id, comp_hist) in history.iter_mut() {
                     if comp_hist.first_tick() >= tick {
-                        // Don't write Removed histories that haven't started yet
                         continue;
                     }
                     if !entry.predicted.iter().any(|(id, _)| id == component_id) {
@@ -200,26 +189,25 @@ fn store_components(
             }
             history.last_archetype = Some(entry.id);
 
-            // Store current values to histories, or create them
             for &(component_id, registry_index) in entry.predicted.iter() {
                 let component = &registry.components[registry_index];
 
                 let history = history
                     .entry(component_id)
                     .or_insert_with(|| ComponentHistory::from_component(component, hist_size));
-                // SAFETY: We don't do structural changes in this system
+                // SAFETY: No structural changes here.
                 let ptr = unsafe { entity.get_mut_by_id(component_id) }.unwrap();
                 if !ptr.is_changed() {
                     continue;
                 }
                 if let TickData::Value(prev_ptr) = history.get_latest(tick.saturating_sub(1)) {
-                    // SAFETY: Both the history and component were fetched using the same ComponentId
+                    // SAFETY: history and component share the same ComponentId.
                     let equal = unsafe { component.equal(prev_ptr, ptr.as_ref()) };
                     if equal {
                         continue;
                     }
                 }
-                // SAFETY: Both the history and component were fetched using the same ComponentId
+                // SAFETY: history and component share the same ComponentId.
                 unsafe { history.write(tick, |dst| component.store(ptr.as_ref(), dst)) };
             }
         }
@@ -244,7 +232,7 @@ fn store_initial(
 
     let world = world.as_unsafe_world_cell();
     let archetypes = world.archetypes();
-    // SAFETY: We don't do structural changes in this system
+    // SAFETY: No structural changes here.
     let world = unsafe { world.world_mut() };
 
     for entry in cache.iter() {
@@ -256,17 +244,14 @@ fn store_initial(
             .map(|e| e.id())
         {
             let entity = world.as_unsafe_world_cell().get_entity(entity).unwrap();
-            // SAFETY: We don't do structural changes in this system. The cache
-            // only lists archetypes containing `PredictedHistory`, so every
-            // entity in them has one.
+            // SAFETY: No structural changes here; cached archetypes all contain
+            // `PredictedHistory`.
             let mut history = unsafe { entity.get_mut::<PredictedHistory>() }.unwrap();
 
             if history.last_archetype == Some(entry.id) {
-                // The archetype hasn't changed so there cannot be any new components
                 continue;
             }
 
-            // Store current values to histories, or create them
             for &(component_id, registry_index) in entry.predicted.iter() {
                 if history.contains_key(&component_id) {
                     continue;
@@ -275,9 +260,9 @@ fn store_initial(
                 let component = &registry.components[registry_index];
                 let mut comp_hist = ComponentHistory::from_component(component, hist_size);
 
-                // SAFETY: We don't do structural changes in this system
+                // SAFETY: No structural changes here.
                 let ptr = unsafe { entity.get_by_id(component_id) }.unwrap();
-                // SAFETY: Both the history and component were fetched using the same ComponentId
+                // SAFETY: history and component share the same ComponentId.
                 unsafe { comp_hist.write(tick, |dst| component.store(ptr, dst)) };
                 history.insert(component_id, comp_hist);
             }

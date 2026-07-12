@@ -46,28 +46,23 @@ impl SparseBlobDeque {
         }
     }
 
-    /// The length of this collection, including the None items
     pub fn len(&self) -> usize {
         self.len as usize
     }
 
-    /// Check if the collection has no items, including None items
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    /// The capacity of the collection, in sparse entries
     pub fn capacity(&self) -> usize {
         self.capacity as usize
     }
 
-    /// The number of stored items, counting only the Some entries
     pub fn stored_items(&self) -> usize {
         self.items.len()
     }
 
-    /// Get the mask for this collection.
-    /// The least significant bit is the back of the collection.
+    // The least significant bit is the back of the collection.
     pub fn mask(&self) -> u64 {
         self.mask
     }
@@ -89,8 +84,6 @@ impl SparseBlobDeque {
         self.items.get(item_index as usize)
     }
 
-    /// Append an entry to the back, `None` meaning an empty (sparse) entry
-    ///
     /// # Safety
     /// - The value written in `write_fn` MUST match the type this collection was made for
     /// - `write_fn` MUST write to the [`PtrMut`], or the value will be uninitialized
@@ -98,7 +91,6 @@ impl SparseBlobDeque {
         if self.len == self.capacity {
             let index_bit = 1 << (self.len - 1);
             if self.mask & index_bit != 0 {
-                // If the first bit was enabled, there is an item to drop
                 self.items.drop_front();
             }
             self.mask &= !index_bit;
@@ -109,7 +101,6 @@ impl SparseBlobDeque {
         if let Some(write_fn) = write_fn {
             if self.items.capacity() == self.items.len() && self.items.capacity() != self.capacity()
             {
-                // If we are out of space, allocate enough space for the new item unless we are at capacity
                 let new_cap = unsafe { NonZero::new_unchecked(self.items.capacity() as u8 + 1) };
                 self.items.resize(new_cap);
             }
@@ -162,8 +153,6 @@ impl SparseBlobDeque {
         self.len = 0;
     }
 
-    /// Replace the entry at `index` with a value
-    ///
     /// # Safety
     /// - The value written in `write_fn` MUST match the type this collection was made for
     /// - `write_fn` MUST write to the [`PtrMut`], or the value will be uninitialized
@@ -177,7 +166,6 @@ impl SparseBlobDeque {
         let ones = (self.mask & search_mask).count_ones();
         if self.mask & index_bit != 0 {
             let drop_fn = self.items.drop();
-            // We had an item here, replace it
             if let Some(mut ptr) = self.items.get_mut(ones as usize - 1) {
                 drop_fn.inspect(|f| unsafe { f(ptr.reborrow().promote()) });
                 write_fn(ptr);

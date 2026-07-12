@@ -1,5 +1,3 @@
-// TODO: Share this logic with component history
-
 use crate::{RollbackFrames, StoreFor, TickData};
 
 use std::{collections::VecDeque, fmt::Debug};
@@ -7,12 +5,9 @@ use std::{collections::VecDeque, fmt::Debug};
 use bevy::prelude::*;
 use bevy_replicon::shared::replicon_tick::RepliconTick;
 
-/// The prediction history of a resource
 #[derive(Resource, Clone)]
 pub struct ResourceHistory<T> {
-    /// The stored per-tick data, oldest first
     pub list: VecDeque<TickData<T>>,
-    /// The tick the last item corresponds to
     pub last_tick: u32,
 }
 
@@ -26,7 +21,6 @@ impl<T> Default for ResourceHistory<T> {
 }
 
 impl<T> ResourceHistory<T> {
-    /// Build a history from a list of tick data, the first item at `start_tick`
     pub fn from_list<const N: usize>(start_tick: u32, list: [TickData<T>; N]) -> Self {
         let last_tick = start_tick + (list.len() as u32).saturating_sub(1);
         Self {
@@ -35,18 +29,14 @@ impl<T> ResourceHistory<T> {
         }
     }
 
-    /// Get the length of the history
     pub fn len(&self) -> usize {
         self.list.len()
     }
 
-    /// Check if the history is empty
     pub fn is_empty(&self) -> bool {
         self.list.is_empty()
     }
 
-    /// Get the value for the specified tick. You always want to load the value stored on
-    /// the previous tick
     pub fn get(&self, previous_tick: RepliconTick) -> &TickData<T> {
         if previous_tick.get() > self.last_tick {
             return &TickData::Missing;
@@ -67,17 +57,13 @@ impl<T> ResourceHistory<T> {
         self.list.get(len - 1 - ago).unwrap_or(&TickData::Missing)
     }
 
-    /// Clean all values after the specified tick. You always want to clean values stored after
-    /// the previous tick.
     pub fn clean(&mut self, previous_tick: RepliconTick) {
         let ago = self.last_tick.saturating_sub(previous_tick.get());
         let len = self.list.len();
-        // We clean all values after previous tick
         self.list.drain(len.saturating_sub(ago as usize)..);
         self.last_tick = self.last_tick.min(previous_tick.get());
     }
 
-    /// Keep only the first item in the history
     pub fn keep_one(&mut self) {
         let len = self.list.len();
         self.list.truncate(1);
@@ -109,10 +95,8 @@ pub fn append_history<T: Resource + Clone + Debug>(
 
     if !hist.is_empty() {
         if tick.get() <= hist.last_tick {
-            // TODO: Overwrite the old parts of the history if the value was not Removed or this wouldn't be the first value
             return;
         }
-        // We need to patch gaps
         while tick.get() > hist.last_tick + 1 {
             if hist.list.len() == hist.list.capacity() {
                 hist.list.pop_front();
@@ -133,8 +117,6 @@ pub fn append_history<T: Resource + Clone + Debug>(
     hist.last_tick = tick.get();
 }
 
-/// A system that saves the initial spawn value if history is empty
-// TODO: Figure something out for reconnecting
 pub(super) fn save_initial<T: Resource + Clone + Debug>(
     t: Res<T>,
     mut history: ResMut<ResourceHistory<T>>,

@@ -13,8 +13,6 @@ use bevy_rewind::history::component_history::{ComponentHistory, TickData::*};
 
 use std::num::NonZero;
 
-// Funnelled through one helper so `ComponentHistory::write` is instantiated once
-// (per-monomorphisation coverage gate).
 fn wr(h: &mut ComponentHistory, tick: u32, v: u16) {
     unsafe { h.write(tick, |ptr| *ptr.deref_mut::<A>() = A(v)) };
 }

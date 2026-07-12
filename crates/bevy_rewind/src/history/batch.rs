@@ -43,7 +43,6 @@ impl InsertBatch {
             return;
         }
 
-        // If items would otherwise not be aligned, add alignment
         let align = comp.layout().align();
         let extra_offset = if self.data.len().is_multiple_of(align) {
             0

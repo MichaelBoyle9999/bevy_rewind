@@ -1,5 +1,3 @@
-//! Tests for the crate-level plugin wiring and message types (src/lib.rs).
-
 #![cfg(all(feature = "client", feature = "server"))]
 
 #[path = "support/entity_input.rs"]
@@ -17,9 +15,6 @@ use bevy_rewind_input::{ConfirmedHorizon, HistoryFor, InputHistory, InputQueuePl
 use entity_input::E;
 use support::{A, Tick};
 
-/// `InputQueuePlugin` registers the input messages and installs both the
-/// client and the server halves (this crate builds with both features, the
-/// listen-server configuration).
 #[test]
 fn plugin_registers_messages_and_both_halves() {
     let mut app = App::new();
@@ -51,8 +46,6 @@ fn plugin_registers_messages_and_both_halves() {
     );
 }
 
-/// `HistoryFor` remaps its target entity and every entity carried inside the
-/// past and future input windows when crossing the network boundary.
 #[test]
 fn history_for_maps_entities() {
     let mut world = World::new();

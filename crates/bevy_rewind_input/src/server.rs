@@ -98,13 +98,13 @@ pub fn receive_inputs<T: InputTrait, Tick: TickSource>(
         let Ok(mut input_queue) = query.get_mut(entity) else {
             continue;
         };
-        if let Some(target) = input_queue.add(*cur_tick, message) {
-            if !sealed(target, *confirmed) {
-                **rollback_target = Some(match **rollback_target {
-                    Some(prev) => prev.min(target),
-                    None => target,
-                });
-            }
+        if let Some(target) = input_queue.add(*cur_tick, message)
+            && !sealed(target, *confirmed)
+        {
+            **rollback_target = Some(match **rollback_target {
+                Some(prev) => prev.min(target),
+                None => target,
+            });
         }
     }
 }

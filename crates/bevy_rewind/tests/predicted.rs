@@ -193,8 +193,6 @@ fn history_skips_unchanged() {
         assert_eq!(v, hist.get(&comp_a).unwrap().get(i as u32).deref().cloned());
     }
     for i in 0..7 {
-        // Read `F` off the raw `TickData<Ptr>`: generic `deref`/`cloned` would spawn
-        // a partially-covered `TickData<F>` instantiation (per-monomorphisation gate).
         let TickData::Value(ptr) = hist.get(&comp_f).unwrap().get(i as u32) else {
             panic!("expected a value at tick {i}");
         };
@@ -312,8 +310,6 @@ fn stores_inserts() {
     let hist = e.get::<PredictedHistory>().unwrap();
     assert!(hist.contains_key(&comp_a));
     assert!(hist.contains_key(&comp_b));
-    // `B` is a ZST marker: check presence on the raw `TickData<Ptr>`; generic
-    // `deref`/`cloned` would spawn a partial `TickData<B>` (per-monomorphisation gate).
     assert!(matches!(hist.get(&comp_b).unwrap().get(1), Missing));
     assert!(matches!(hist.get(&comp_b).unwrap().get(2), Value(_)));
 
@@ -470,8 +466,6 @@ fn skips_future_history_on_predicted_archetype_change() {
     assert_eq!(1, hist.get(&comp_a).unwrap().stored_items());
 }
 
-/// A component whose history has not started yet is likewise skipped when the
-/// entity loses all predicted components (moving to the empty archetype).
 #[test]
 fn skips_future_history_when_all_predicted_removed() {
     let mut app = init_app();
@@ -488,7 +482,6 @@ fn skips_future_history_when_all_predicted_removed() {
     app.insert_resource(StoreFor(RepliconTick::new(5)));
     app.update();
 
-    // Drop A entirely, then store at an earlier tick.
     app.world_mut().entity_mut(e1).remove::<A>();
     app.insert_resource(StoreFor(RepliconTick::new(3)));
     app.update();
@@ -496,9 +489,6 @@ fn skips_future_history_when_all_predicted_removed() {
     let world = app.world_mut();
     let comp_a = world.register_component::<A>();
     let hist = world.entity(e1).get::<PredictedHistory>().unwrap();
-    // The future-starting history was skipped, not marked removed.
     assert_eq!(a(1), hist.get(&comp_a).unwrap().get(5).deref().cloned());
     assert_eq!(1, hist.get(&comp_a).unwrap().stored_items());
 }
-
-// TODO: Test cleanup of histories

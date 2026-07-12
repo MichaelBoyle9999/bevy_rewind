@@ -1,5 +1,3 @@
-//! Tests for batched component inserts (`src/history/batch.rs`).
-
 #[path = "support/comp_a.rs"]
 mod comp_a;
 #[path = "support/comp_b.rs"]
@@ -17,22 +15,15 @@ use bevy_rewind::history::component::HistoryComponent;
 
 use bevy::{ecs::component::ComponentId, ecs::system::EntityCommand, prelude::*};
 
-/// A single-byte component, used to force an unaligned data cursor before a
-/// wider component is pushed.
 #[derive(Component, Clone, PartialEq, Eq, Debug)]
 struct Byte(u8);
 
-/// Copy `bytes` into the batch slot. This is non-generic, so `InsertBatch::push`
-/// is instantiated exactly once (a closure defined inside a generic fn would be a
-/// distinct type per monomorphisation). One instantiation then covers the
-/// zero-sized, value, and alignment-padding branches.
 fn push_bytes(batch: &mut InsertBatch, id: ComponentId, comp: &HistoryComponent, bytes: &[u8]) {
     batch.push(id, comp, |ptr| unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr(), bytes.len());
     });
 }
 
-/// Push `v` into the batch by copying its raw bytes through [`push_bytes`].
 fn push_val<T: Clone + PartialEq>(batch: &mut InsertBatch, id: ComponentId, v: T) {
     let comp = HistoryComponent::new::<T>();
     let v = ManuallyDrop::new(v);
@@ -79,7 +70,6 @@ fn push_zero_sized_skips_data() {
     let mut batch = InsertBatch::new();
     assert!(batch.is_empty());
 
-    // A zero-sized component records its id but stores no data.
     push_val(&mut batch, comp_b, comp_b::B);
     assert!(!batch.is_empty());
 }
@@ -91,9 +81,7 @@ fn push_unaligned_component_pads() {
     let comp_a = world.register_component::<A>();
 
     let mut batch = InsertBatch::new();
-    // A single byte leaves the cursor at an odd offset...
     push_val(&mut batch, comp_byte, Byte(9));
-    // ...so the following `A` (align 2) forces alignment padding.
     push_val(&mut batch, comp_a, A(7));
 
     let e1 = world.spawn_empty().id();

@@ -27,12 +27,9 @@ pub struct AuthoriativeCleanupPlugin;
 impl Plugin for AuthoriativeCleanupPlugin {
     fn build(&self, app: &mut App) {
         _ = app;
-        // TODO: Implement cleanup to remove component histories that would entirely evaluate to Missing/Removed
-        // TODO: Implement system to resize histories when RollbackFrames changes
     }
 }
 
-/// A component holding a history of authoritative (from the server) values
 #[derive(Component, Deref, DerefMut, Default)]
 pub struct AuthoritativeHistory {
     #[deref]
@@ -75,7 +72,6 @@ pub fn write_history_internal<T: Component + Clone + PartialEq + Debug>(
         ComponentHistory::from_type::<T>(NonZero::new(frames.history_size() as u8).unwrap())
     });
 
-    // TODO: Figure out deduplication of values
     // SAFETY: We are writing to a history matching our ComponentId
     unsafe {
         comp_hist.write(received_tick.get(), |dst| {
@@ -89,11 +85,7 @@ pub fn write_history_internal<T: Component + Clone + PartialEq + Debug>(
     }
 }
 
-// Non-generic so its two warn arms are counted once, not once per `T` that
-// `write_history_internal` is instantiated for.
 fn warn_missing_authoritative_history(entity: &DeferredEntity) {
-    // Eagerly formatted: `warn!` format arguments are lazily evaluated and
-    // would not run without an active subscriber.
     let diagnostic = if entity.contains::<Predicted>() {
         format!(
             "Predicted entity {} is missing AuthoritativeHistory",
@@ -117,8 +109,6 @@ pub fn remove_history_internal(
     tick: RepliconTick,
     entity: &mut DeferredEntity,
 ) {
-    // Eagerly formatted: `warn!` format arguments are lazily evaluated and
-    // would not run without an active subscriber.
     let Some(mut history) = entity.get_mut::<AuthoritativeHistory>() else {
         let diagnostic = format!(
             "Trying to remove history for {component_id:?} from entity without AuthoritativeHistory"

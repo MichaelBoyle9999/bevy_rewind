@@ -1,5 +1,3 @@
-//! Tests for the blobby ring buffer (`src/history/blob_deque.rs`).
-
 #[path = "support/comp_a.rs"]
 mod comp_a;
 #[path = "support/comp_b.rs"]
@@ -28,17 +26,12 @@ trait MapDerefMut<'a> {
     fn deref<T>(self) -> Option<&'a mut T>;
 }
 
-// WARN: This function is actually unsafe, but not marked as such to avoid cluttering the tests
-// DO NOT USE THIS OUTSIDE OF TESTS!
+// WARN: Actually unsafe, not marked as such to avoid cluttering the tests. Tests only.
 impl<'a> MapDerefMut<'a> for Option<PtrMut<'a>> {
     fn deref<T>(self) -> Option<&'a mut T> {
         self.map(|v| unsafe { v.deref_mut::<T>() })
     }
 }
-
-// Closures are funnelled through these monomorphic helpers so the generic
-// `append`/`insert` methods are instantiated once per helper, letting a single
-// instantiation exercise every branch.
 
 fn ba(h: &mut BlobDeque, v: u16) {
     unsafe { h.append(|ptr| *ptr.deref_mut::<A>() = A(v)) };
@@ -56,9 +49,6 @@ fn ba_d(h: &mut BlobDeque, v: u16, drops: &DropList) {
     };
 }
 
-// Zero-sized appends/inserts funnel through the same value closures: the closure
-// is never invoked for a zero-sized deque (`new_ptr` yields `None`), so a single
-// instantiation covers both the value and zero-sized paths.
 fn bi(h: &mut BlobDeque, at: usize, v: u16) -> Option<()> {
     unsafe { h.insert(at, |ptr| *ptr.deref_mut::<A>() = A(v)) }
 }
@@ -84,9 +74,7 @@ fn get_out_of_bounds() {
         ba(&mut history, i);
     }
 
-    // Out of bounds, within capacity
     assert_eq!(None, history.get(4).deref::<A>());
-    // Out of bounds and out of capacity
     assert_eq!(None, history.get(5).deref::<A>());
 }
 
@@ -111,9 +99,7 @@ fn get_mut_out_of_bounds() {
         ba(&mut history, i);
     }
 
-    // Out of bounds, within capacity
     assert_eq!(None, history.get_mut(4).deref::<A>());
-    // Out of bounds and out of capacity
     assert_eq!(None, history.get_mut(5).deref::<A>());
 }
 
@@ -185,10 +171,8 @@ fn wraps() {
     let mut history = BlobDeque::new(Layout::new::<A>(), None, NonZero::new(3).unwrap());
 
     for i in 1..=5 {
-        // Write 1, 2, 3, 4, 5
         ba(&mut history, i);
     }
-    // Only 3, 4, 5 should be in the list
     assert_eq!(3, history.len);
     assert_eq!(3, history.capacity);
     assert_eq!(Some(&A(3)), history.get(0).map(|v| unsafe { v.deref() }));
@@ -204,7 +188,6 @@ fn wraps_zst() {
     for _ in 1..=20 {
         ba(&mut history, 0);
     }
-    // Only 3 values should be in the history
     assert_eq!(3, history.len);
     assert_eq!(3, history.capacity);
     assert_eq!(Some(&B), history.get(0).map(|v| unsafe { v.deref() }));
@@ -230,11 +213,8 @@ fn wraps_many_times() {
 fn insert_trivial() {
     let mut history = BlobDeque::new(Layout::new::<A>(), None, NonZero::new(5).unwrap());
 
-    // Add the item to the back
     bi(&mut history, 0, 2).unwrap();
-    // Add the item to the front
     bi(&mut history, 0, 1).unwrap();
-    // Add the item to the back, but this time the list isn't empty
     bi(&mut history, 2, 3).unwrap();
 
     assert_eq!(3, history.len());
@@ -253,7 +233,6 @@ fn insert_errors() {
 
     ba(&mut history, 1);
 
-    // Not connected to current items
     let res = bi(&mut history, 2, 0);
     assert!(res.is_none());
 
@@ -261,16 +240,13 @@ fn insert_errors() {
         ba(&mut history, 1);
     }
 
-    // No capacity
     let res = bi(&mut history, 0, 0);
     assert!(res.is_none());
 }
 
 #[test]
 fn insert_moves() {
-    // Check both at wrapping capacity and some space over
     for cap in 7..=8 {
-        // Check at all start positions to make sure we hit every move condition
         for start in 0..cap {
             insert_move_with_start(start, cap);
         }
@@ -286,7 +262,6 @@ fn insert_move_with_start(start: u8, cap: u8) {
         ba(&mut history, i);
     }
 
-    // Insert an item in between
     bi(&mut history, 3, 4).unwrap();
 
     assert_eq!(7, history.len(), "{}", case_str);
@@ -311,7 +286,6 @@ fn shrink() {
     let mut history = BlobDeque::new(Layout::new::<A>(), None, NonZero::new(5).unwrap());
     let old_ptr = history.data;
 
-    // We write enough values so we can test items getting removed after shrinking
     for i in 1..=5 {
         ba(&mut history, i);
     }
@@ -326,7 +300,6 @@ fn shrink() {
     assert_eq!(3, history.capacity);
     assert_eq!(0, history.start);
 
-    // We should only have the last 3 values
     for (i, v) in (3..=5).enumerate() {
         assert_eq!(Some(&A(v)), history.get(i).map(|v| unsafe { v.deref() }));
     }
@@ -337,8 +310,6 @@ fn shrink_wrapped() {
     let mut history = BlobDeque::new(Layout::new::<A>(), None, NonZero::new(5).unwrap());
     let old_ptr = history.data;
 
-    // We write 7 values to a history of 5 items, so it's wrapped in such a way
-    // that shrinking it down to 3 items needs to copy from both sides
     for i in 1..=7 {
         ba(&mut history, i);
     }
@@ -355,7 +326,6 @@ fn shrink_wrapped() {
     assert_eq!(3, history.capacity);
     assert_eq!(0, history.start);
 
-    // We should only have the last 3 values
     for (i, v) in (5..=7).enumerate() {
         assert_eq!(Some(&A(v)), history.get(i).map(|v| unsafe { v.deref() }));
     }
@@ -376,7 +346,6 @@ fn grow() {
     let mut history = BlobDeque::new(Layout::new::<A>(), None, NonZero::new(3).unwrap());
     let old_ptr = history.data;
 
-    // We fully fill up our history
     for i in 1..=3 {
         ba(&mut history, i);
     }
@@ -391,7 +360,6 @@ fn grow() {
     assert_eq!(5, history.capacity);
     assert_eq!(0, history.start);
 
-    // We should be able to write more values
     for i in 4..=5 {
         ba(&mut history, i);
     }
@@ -586,7 +554,6 @@ fn drop_front_zst() {
 
     history.drop_front();
 
-    // ZST fronts don't advance the start; only the length shrinks
     assert_eq!(2, history.len);
     assert_eq!(0, history.start);
 }
@@ -621,7 +588,6 @@ fn insert_zst() {
 fn insert_at_front_wrapped() {
     let mut history = BlobDeque::new(Layout::new::<A>(), None, NonZero::new(4).unwrap());
 
-    // Wrap the buffer so start != 0, then make room at the front
     for i in 1..=5 {
         ba(&mut history, i);
     }
@@ -631,7 +597,6 @@ fn insert_at_front_wrapped() {
     assert_eq!(3, history.start);
     assert_eq!(2, history.len);
 
-    // Insert at the front with a non-zero start: the start steps back
     bi(&mut history, 0, 3).unwrap();
 
     assert_eq!(2, history.start);
@@ -665,8 +630,6 @@ fn resize_zst() {
 fn shrink_start_past_new_capacity() {
     let mut history = BlobDeque::new(Layout::new::<A>(), None, NonZero::new(4).unwrap());
 
-    // Wrap so that start = 2, then shrink to 1: the lost items push the start
-    // past the old capacity, so the copy comes entirely from the wrapped part.
     for i in 1..=6 {
         ba(&mut history, i);
     }
@@ -698,7 +661,6 @@ fn debug_items_hex() {
     ba(&mut history, 1);
     ba(&mut history, 2);
 
-    // A is a native-endian u16; format both byte orders to stay portable
     let (one, two) = if cfg!(target_endian = "little") {
         ("0x0100", "0x0200")
     } else {
@@ -721,7 +683,6 @@ fn debug_zst_items() {
 
 #[test]
 fn array_layout_overflow_is_none() {
-    // Three maximum-size items overflow `usize`, so no layout exists
     let huge = Layout::from_size_align(isize::MAX as usize - 7, 8).unwrap();
     assert!(array_layout(&huge, 3).is_none());
 }
