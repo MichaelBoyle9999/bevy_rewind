@@ -1,3 +1,4 @@
 /target
-.cargo
+**/.cargo/*
+!**/.cargo/mutants.toml
 mutants.out*/

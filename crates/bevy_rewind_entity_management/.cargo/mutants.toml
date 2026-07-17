@@ -1,0 +1,11 @@
+# cargo-mutants configuration for the bevy_rewind_entity_management
+# crate. Lives at `.cargo/mutants.toml` so a bare `cargo mutants`
+# auto-discovers it when this crate stands alone as its own repo; inside
+# the workspace the justfile `mutants` recipe passes it explicitly,
+# since cargo-mutants anchors config discovery (and its `mutants.out`)
+# at the workspace root, not the crate. No `examine_globs`: invoking
+# from the crate root already scopes mutation to this crate's package,
+# and a workspace-relative glob would match nothing once the crate is
+# extracted. Equivalent-mutant exclusions go here as `exclude_re`; file-
+# and function-level exclusions live in-source as
+# `#[cfg_attr(test, mutants::skip)]` attributes.
