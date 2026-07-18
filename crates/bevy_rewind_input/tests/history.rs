@@ -3,6 +3,8 @@ mod entity_input;
 mod support;
 #[path = "support/hist.rs"]
 mod support_hist;
+#[path = "support/ramp.rs"]
+mod support_ramp;
 
 use bevy::{ecs::entity::MapEntities, prelude::*};
 use bevy_replicon::shared::replicon_tick::RepliconTick;
@@ -10,6 +12,7 @@ use bevy_rewind_input::InputHistory;
 use entity_input::E;
 use support::{A, Tick};
 use support_hist::hist;
+use support_ramp::Ramp;
 
 #[test]
 fn get() {
@@ -77,6 +80,37 @@ fn write_with_gaps_wrap() {
             (6..10).map(A).chain((0..5).map(|_| A(9))).chain([A(15)])
         ),
         history
+    );
+}
+
+#[test]
+fn write_gap_equal_to_capacity_salvages_instead_of_clearing() {
+    let mut history = InputHistory::<A>::default();
+    history.write(Tick(10), A(1));
+    history.write(Tick(11), A(2));
+    let cap = history.list.capacity() as u32;
+
+    history.write(Tick(11 + cap), A(9));
+
+    assert!(
+        history.list.len() > 1,
+        "a gap exactly equal to capacity must salvage the tail and gap-fill \
+         (leaving a full window), not clear the list down to the lone new entry",
+    );
+    assert_eq!(RepliconTick::new(11 + cap), history.updated_at());
+}
+
+#[test]
+fn write_gap_fill_extrapolates_each_missing_tick_forward() {
+    let mut history = InputHistory::<Ramp>::default();
+    history.write(Tick(5), Ramp(0));
+    history.write(Tick(8), Ramp(100));
+
+    assert_eq!(
+        hist(5, [Ramp(0), Ramp(1), Ramp(2), Ramp(100)]),
+        history,
+        "the two skipped ticks (6, 7) must be filled by extrapolating the last \
+         known input forward by 1 and 2 ticks — the offset is (gap_tick - last)",
     );
 }
 
@@ -175,6 +209,49 @@ fn replace_section_seeds_empty_history_in_range() {
     history.replace_section(entries([(20, A(5))]));
 
     assert_eq!(hist(20, [A(5)]), history);
+}
+
+#[cfg(feature = "client")]
+#[test]
+fn replace_section_applies_entry_exactly_ten_ticks_behind_head() {
+    let mut history = hist(0, (0..15).map(A));
+    history.replace_section(entries([(4, A(99))]));
+
+    assert_eq!(
+        Some(A(99)),
+        history.get(Tick(4), false),
+        "an entry exactly ten ticks behind updated_at (14) is not yet too old \
+         and must be applied in place, not skipped",
+    );
+}
+
+#[cfg(feature = "client")]
+#[test]
+fn replace_section_replaces_the_head_tick_in_place() {
+    let mut history = hist(10, [A(1), A(2), A(3)]);
+    history.replace_section(entries([(10, A(50))]));
+
+    assert_eq!(
+        hist(10, [A(50), A(2), A(3)]),
+        history,
+        "an entry at exactly first_tick must replace the head in place, not \
+         prepend a new out-of-range element ahead of it",
+    );
+}
+
+#[cfg(feature = "client")]
+#[test]
+fn replace_section_prepend_extrapolates_each_gap_tick_forward() {
+    let mut history = hist(20, [Ramp(0), Ramp(0)]);
+    history.replace_section([(RepliconTick::new(17), Ramp(0))].into_iter());
+
+    assert_eq!(
+        hist(17, [Ramp(0), Ramp(1), Ramp(2), Ramp(0), Ramp(0)]),
+        history,
+        "prepending three ticks before first_tick must fill the two gap ticks \
+         (18, 19) by extrapolating the entry forward by 1 and 2 — the offset is \
+         (first_tick - tick - 1)",
+    );
 }
 
 #[test]

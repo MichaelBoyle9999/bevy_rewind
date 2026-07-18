@@ -9,3 +9,23 @@
 # Equivalent-mutant exclusions go here as `exclude_re`; file- and
 # function-level exclusions live in-source as
 # `#[cfg_attr(test, mutants::skip)]` attributes.
+exclude_re = [
+    # InputQueue::add novelty check `t.get() > hc`, where `hc` is the tick of
+    # `past.back()`. This arm is only reached when `t` was found in NEITHER
+    # `past` NOR `queue`; but `hc` is by construction a tick present in `past`,
+    # so the only input that would distinguish `>` from `>=` (t == hc) can
+    # never reach here — it is always intercepted by the `existing` lookup
+    # above. The boundary is therefore unobservable. Other `> -> >=` mutants in
+    # `add` (e.g. the queue re-merge filter) ARE killed, so this is anchored to
+    # the exact site rather than the whole function.
+    "queue\\.rs:73:33: replace > with >= in InputQueue<T>::add",
+    # InputHistory::write gap-fill trim `while tick - self.first_tick() > cap`.
+    # Popping one extra front entry (the `>=` mutant) is always compensated by
+    # the `if self.list.len() == self.list.capacity() { pop_front }` at the tail
+    # of write: whenever the trim actually pops, the post-extend length lands on
+    # exactly `cap`, so the tail `pop_front` fires for the correct code and not
+    # for the mutant, leaving both with an identical final window. The sibling
+    # `tick - self.updated_at > cap` clear/salvage boundary earlier in the same
+    # function IS killed, so this is anchored to the exact trim site.
+    "history\\.rs:85:48: replace > with >= in InputHistory<T>::write",
+]

@@ -3,6 +3,8 @@
 mod support;
 #[path = "support/hist.rs"]
 mod support_hist;
+#[path = "support/ramp.rs"]
+mod support_ramp;
 
 use arraydeque::ArrayDeque;
 use bevy::{ecs::entity::MapEntities, prelude::*};
@@ -11,6 +13,7 @@ use bevy_rewind_input::{InputQueue, InputTrait};
 use serde::{Deserialize, Serialize};
 use support::{A, Tick};
 use support_hist::hist;
+use support_ramp::Ramp;
 
 #[derive(Component, Clone, Default, Serialize, Deserialize, Debug, PartialEq, TypePath)]
 pub struct NoRepeat(u8);
@@ -227,6 +230,79 @@ fn queue_ignores_empty_history() {
     assert_eq!(None, queue.add(Tick(5), &hist(0, [])));
     assert_eq!(0, queue.queue().count());
     assert_eq!(None, queue.received_horizon());
+}
+
+#[test]
+fn received_horizon_tracks_running_maximum() {
+    let mut queue = InputQueue::<A>::default();
+    assert_eq!(None, queue.received_horizon());
+
+    queue.add(Tick(20), &hist(5, [A(1), A(2), A(3), A(4)]));
+    assert_eq!(
+        Some(RepliconTick::new(8)),
+        queue.received_horizon(),
+        "the first message establishes the horizon at its last tick",
+    );
+
+    queue.add(Tick(20), &hist(5, [A(1), A(2)]));
+    assert_eq!(
+        Some(RepliconTick::new(8)),
+        queue.received_horizon(),
+        "a later message with a lower last tick must not lower the running maximum",
+    );
+
+    queue.add(
+        Tick(20),
+        &hist(5, [A(1), A(2), A(3), A(4), A(5), A(6), A(7), A(8)]),
+    );
+    assert_eq!(
+        Some(RepliconTick::new(12)),
+        queue.received_horizon(),
+        "a message with a higher last tick must advance the running maximum",
+    );
+}
+
+#[test]
+fn add_remerge_preserves_out_of_range_entries_and_replaces_in_range() {
+    let mut queue = InputQueue::<A>::default();
+    queue.add(
+        Tick(20),
+        &hist(5, [A(1), A(2), A(3), A(4), A(5), A(6), A(7), A(8)]),
+    );
+
+    queue.add(Tick(20), &hist(7, [A(50), A(51), A(52), A(53)]));
+
+    assert_eq!(
+        ArrayDeque::from([
+            (RepliconTick::new(5), A(1)),
+            (RepliconTick::new(6), A(2)),
+            (RepliconTick::new(7), A(50)),
+            (RepliconTick::new(8), A(51)),
+            (RepliconTick::new(9), A(52)),
+            (RepliconTick::new(10), A(53)),
+            (RepliconTick::new(11), A(7)),
+            (RepliconTick::new(12), A(8)),
+        ]),
+        queue.queue,
+        "old entries strictly past the incoming range (11, 12) must survive, the \
+         entry at the incoming last tick (10) must be replaced by the incoming \
+         value, and no tick may be duplicated",
+    );
+}
+
+#[test]
+fn novelty_prediction_extrapolates_forward_from_the_last_consumed_tick() {
+    let mut queue = InputQueue::<Ramp>::default();
+    queue.add(Tick(0), &hist(5, [Ramp(0)]));
+    assert_eq!(Some(Ramp(0)), queue.next(Tick(5)));
+
+    assert_eq!(
+        None,
+        queue.add(Tick(20), &hist(7, [Ramp(2)])),
+        "a new past tick two ticks beyond the last consumed input, whose value \
+         equals that input extrapolated forward by two ticks, is a correct \
+         prediction and not novel — the forward offset (t - last) must be used",
+    );
 }
 
 #[test]

@@ -55,10 +55,13 @@ impl<T: InputTrait> InputHistory<T> {
 
     pub fn get(&self, tick: impl Into<RepliconTick>, repeat: bool) -> Option<T> {
         let tick = tick.into();
-        if (tick > self.updated_at() && !(repeat && T::repeats())) || tick < self.first_tick() {
+        if tick < self.first_tick() {
             return None;
         }
         if tick > self.updated_at() {
+            if !(repeat && T::repeats()) {
+                return None;
+            }
             return self
                 .list
                 .back()
@@ -75,7 +78,7 @@ impl<T: InputTrait> InputHistory<T> {
             return;
         }
 
-        if !self.list.is_empty() && tick > self.updated_at + 1 {
+        if !self.list.is_empty() {
             if tick - self.updated_at > self.list.capacity() as u32 {
                 self.list.clear();
             } else {

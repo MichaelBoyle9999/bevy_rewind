@@ -3,6 +3,8 @@
 mod support;
 #[path = "support/hist.rs"]
 mod support_hist;
+#[path = "support/ramp.rs"]
+mod support_ramp;
 
 use bevy::prelude::*;
 use bevy_replicon::shared::replicon_tick::RepliconTick;
@@ -13,6 +15,7 @@ use bevy_rewind_input::{
 };
 use support::{A, Tick};
 use support_hist::hist;
+use support_ramp::Ramp;
 
 #[test]
 fn stores_inputs_with_authority() {
@@ -86,6 +89,52 @@ fn loads_inputs_without_authority() {
     assert_eq!(A(2), *e.get::<A>().unwrap());
     let e = app.world().entity(e3);
     assert_eq!(A(1), *e.get::<A>().unwrap());
+}
+
+#[test]
+fn load_inputs_remote_repeats_last_input_past_history_end() {
+    let mut app = App::new();
+    app.add_systems(Update, load_inputs::<A, Tick>)
+        .insert_resource(Tick(5));
+    let e = app.world_mut().spawn((A(0), hist(2, [A(7)]))).id();
+
+    app.update();
+
+    assert_eq!(
+        A(7),
+        *app.world().entity(e).get::<A>().unwrap(),
+        "a remote body must repeat (extrapolate) its last known input for a tick \
+         past the end of its history, not fall back to the default input",
+    );
+}
+
+#[test]
+fn receive_input_reconstructs_past_window_by_forward_offset() {
+    let mut app = App::new();
+    app.add_message::<HistoryFor<Ramp>>()
+        .init_resource::<RollbackTarget>()
+        .insert_resource(Tick(11))
+        .add_systems(Update, receive_inputs::<Ramp, Tick>);
+    let mut seed = InputHistory::<Ramp>::default();
+    seed.write(Tick(8), Ramp(0));
+    let e = app.world_mut().spawn(seed).id();
+
+    app.world_mut().write_message(HistoryFor {
+        entity: e,
+        tick: Tick(10).into(),
+        past: [(2u8, Ramp(0))].into_iter().collect(),
+        future: default(),
+    });
+
+    app.update();
+
+    assert_eq!(
+        Some(&hist(8, [Ramp(0), Ramp(1), Ramp(2)])),
+        app.world().entity(e).get::<InputHistory<Ramp>>(),
+        "reconstructing the past window from a single anchor must extrapolate it \
+         forward across the offset (rt - rrt): tick 8 keeps the anchor, ticks 9 \
+         and 10 are that anchor repeated 1 and 2 ticks later",
+    );
 }
 
 #[test]
