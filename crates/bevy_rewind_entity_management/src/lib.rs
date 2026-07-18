@@ -1,6 +1,6 @@
 mod client;
 
-pub use client::{Despawned, EntityManagementPlugin, Unspawned};
+pub use client::{Despawned, EntityManagementPlugin, Unspawned, outside_history_window};
 
 use bevy::prelude::*;
 use bevy_replicon::shared::replicon_tick::RepliconTick;

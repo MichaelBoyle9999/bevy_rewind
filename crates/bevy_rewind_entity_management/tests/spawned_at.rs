@@ -92,6 +92,36 @@ fn rollback_past_spawn_marks_entity_unspawned() {
 }
 
 #[test]
+fn rollback_to_load_from_boundary_does_not_mark_unspawned() {
+    let mut app = init_app(15);
+    app.init_resource::<UnspawnedAtPostRollback>();
+    app.add_systems(
+        RollbackSchedule::PostRollback,
+        |q: Query<Entity, (With<Unspawned>, Or<(With<Disabled>, Without<Disabled>)>)>,
+         mut probe: ResMut<UnspawnedAtPostRollback>| {
+            probe.0 = q.iter().collect();
+        },
+    );
+
+    let e = app.world_mut().spawn(Predicted).id();
+    app.update();
+    app.world_mut()
+        .entity_mut(e)
+        .insert(SpawnedAt(RepliconTick::new(5)));
+
+    **app.world_mut().resource_mut::<RollbackTarget>() = Some(RepliconTick::new(6));
+    app.update();
+
+    let probed = &app.world().resource::<UnspawnedAtPostRollback>().0;
+    assert!(
+        !probed.contains(&e),
+        "entity spawned exactly at load_from (target 6 => load_from 5) must not be Unspawned; \
+         marking it requires a strictly-after comparison, not at-or-after; saw {:?}",
+        probed,
+    );
+}
+
+#[test]
 fn rollback_to_spawn_tick_or_later_does_not_unspawn() {
     let mut app = init_app(15);
     let e = app.world_mut().spawn(Predicted).id();

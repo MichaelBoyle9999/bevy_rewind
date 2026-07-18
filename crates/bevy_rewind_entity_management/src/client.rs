@@ -126,6 +126,10 @@ fn replicon_despawn<Tick: TickSource>(ctx: &DespawnCtx, mut entity: EntityWorldM
 #[derive(Component, Clone, Copy, Deref)]
 struct RemovedByServerAt(RepliconTick);
 
+pub fn outside_history_window(stamped: RepliconTick, history: u32, tick: RepliconTick) -> bool {
+    stamped + history < tick
+}
+
 fn disable_server_despawned_entities<Tick: TickSource>(
     mut commands: Commands,
     query: Query<
@@ -136,8 +140,9 @@ fn disable_server_despawned_entities<Tick: TickSource>(
     frames: Res<RollbackFrames>,
 ) {
     let tick = (*tick).into();
+    let history = frames.history_size() as u32;
     for (entity, at, is_despawned) in query.iter() {
-        if is_despawned && **at + (frames.history_size() as u32) < tick {
+        if is_despawned && outside_history_window(**at, history, tick) {
             commands.entity(entity).try_despawn();
         } else if !is_despawned && **at <= tick {
             commands.entity(entity).insert(Despawned);
@@ -192,8 +197,10 @@ fn despawn_unused_entities<Tick: TickSource>(
     tick: Res<Tick>,
     frames: Res<RollbackFrames>,
 ) {
+    let tick = (*tick).into();
+    let history = frames.history_size() as u32;
     for (entity, unused_at) in query.iter() {
-        if **unused_at + (frames.history_size() as u32) < (*tick).into() {
+        if outside_history_window(**unused_at, history, tick) {
             commands.entity(entity).try_despawn();
         }
     }
